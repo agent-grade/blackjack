@@ -1,14 +1,22 @@
 use std::io::{IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
+use signal_hook::iterator::Signals;
 
 use crate::cli::Command;
 
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 const BUF_LEN: usize = 8192;
 const EOT: u8 = 0x04;
+
+static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
 pub fn run(command: &Command) -> Result<()> {
     let pty = native_pty_system()
@@ -30,6 +38,7 @@ pub fn run(command: &Command) -> Result<()> {
 
     let mut from_child = pty.master.try_clone_reader().context("reading the pty")?;
     let to_child = pty.master.take_writer().context("writing to the pty")?;
+    let master: Master = Arc::new(Mutex::new(pty.master));
 
     // portable_pty::UnixMasterWriter writes "\n" + EOT when dropped. That newline
     // is an Enter the wrapped program never received, so this writer is never
@@ -37,6 +46,9 @@ pub fn run(command: &Command) -> Result<()> {
     let mut to_child = ManuallyDrop::new(to_child);
     let piped_stdin = !std::io::stdin().is_terminal();
 
+    // Registered before raw mode is entered: a signal arriving in between would
+    // otherwise hit the default disposition and leave the terminal raw.
+    watch_signals(Arc::clone(&master)).context("watching for signals")?;
     let _raw = RawMode::enable();
 
     // Detached: this read blocks, and the child exiting must not wait on a keystroke.
@@ -56,7 +68,31 @@ pub fn run(command: &Command) -> Result<()> {
     let mut stdout = std::io::stdout();
     pump(&mut from_child, &mut stdout);
 
-    child.wait().context("waiting for the wrapped command")?;
+    let status = child.wait().context("waiting for the wrapped command");
+    // The wrapped program's terminal dies with this handle, so it is held until
+    // the session is genuinely over rather than left to the signal thread.
+    drop(master);
+    status?;
+    Ok(())
+}
+
+/// A resize the wrapped program never hears about leaves it drawing to the old
+/// geometry, and a signal death skips every destructor — including the one that
+/// takes the terminal back out of raw mode, which otherwise outlives us.
+fn watch_signals(master: Master) -> Result<()> {
+    let mut signals = Signals::new([SIGWINCH, SIGHUP, SIGINT, SIGTERM])?;
+    std::thread::spawn(move || {
+        for signal in signals.forever() {
+            if signal == SIGWINCH {
+                if let Ok(master) = master.lock() {
+                    let _ = master.resize(inherited_size());
+                }
+            } else {
+                restore_terminal();
+                std::process::exit(128 + signal);
+            }
+        }
+    });
     Ok(())
 }
 
@@ -98,24 +134,29 @@ fn pty_size(reported: Option<(u16, u16)>) -> PtySize {
 /// Raw mode for as long as the wrapped command runs — the child's own terminal
 /// handling is the only one that should see the keystrokes. Off outside a tty,
 /// which is what makes `blackjack -- echo hi` work in a pipeline.
-struct RawMode {
-    enabled: bool,
-}
+struct RawMode;
 
 impl RawMode {
     fn enable() -> Self {
-        let enabled = std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-            && crossterm::terminal::enable_raw_mode().is_ok();
-        Self { enabled }
+        let on_a_terminal =
+            std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if on_a_terminal && crossterm::terminal::enable_raw_mode().is_ok() {
+            RAW_ACTIVE.store(true, Ordering::SeqCst);
+        }
+        Self
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        if self.enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
+        restore_terminal();
+    }
+}
+
+/// Shared with the signal thread, so it runs at most once whichever path exits.
+fn restore_terminal() {
+    if RAW_ACTIVE.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
