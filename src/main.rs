@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     };
 
     match pty::run(&command) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(error) => {
             eprintln!("blackjack: {error:#}");
             ExitCode::FAILURE

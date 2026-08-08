@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
@@ -13,12 +13,16 @@ use crate::cli::Command;
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 const BUF_LEN: usize = 8192;
 const EOT: u8 = 0x04;
+// libc exposes no NSIG on macOS. The lookup is a round trip through one
+// strsignal table, so a range wide enough for Linux's realtime signals costs
+// nothing here: this platform's signals above 31 have no name to match.
+const HIGHEST_SIGNAL: i32 = 64;
 
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
-pub fn run(command: &Command) -> Result<()> {
+pub fn run(command: &Command) -> Result<u32> {
     let pty = native_pty_system()
         .openpty(inherited_size())
         .context("opening a pty")?;
@@ -72,8 +76,30 @@ pub fn run(command: &Command) -> Result<()> {
     // The wrapped program's terminal dies with this handle, so it is held until
     // the session is genuinely over rather than left to the signal thread.
     drop(master);
-    status?;
-    Ok(())
+    Ok(exit_code(&status?))
+}
+
+/// portable-pty reports a signal death as code 1 plus a signal *name*, so
+/// propagating its code verbatim would have blackjack claim an ordinary failure
+/// where the shell reports 128 + the signal number. The name is turned back into
+/// its number through the same `strsignal` table that produced it, which is what
+/// keeps this from depending on the locale that table is rendered in.
+fn exit_code(status: &ExitStatus) -> u32 {
+    let Some(died_from) = status.signal() else {
+        return status.exit_code();
+    };
+    (1..=HIGHEST_SIGNAL)
+        .find(|&signal| signal_name(signal).as_deref() == Some(died_from))
+        .map_or_else(|| status.exit_code(), |signal| 128 + signal as u32)
+}
+
+fn signal_name(signal: i32) -> Option<String> {
+    // SAFETY: the returned pointer stays valid until this thread's next
+    // strsignal call — it names a reusable per-thread buffer, not a static —
+    // and it is copied into an owned String before this function returns.
+    let name = unsafe { libc::strsignal(signal) };
+    (!name.is_null())
+        .then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
 }
 
 /// A resize the wrapped program never hears about leaves it drawing to the old
