@@ -1,5 +1,7 @@
 mod cli;
 mod pty;
+mod screen;
+mod tap;
 
 use std::process::ExitCode;
 

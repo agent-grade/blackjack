@@ -9,6 +9,8 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
 use crate::cli::Command;
+use crate::screen::{Screen, SharedScreen};
+use crate::tap::Tap;
 
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 const BUF_LEN: usize = 8192;
@@ -23,9 +25,10 @@ static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
 pub fn run(command: &Command) -> Result<u32> {
-    let pty = native_pty_system()
-        .openpty(inherited_size())
-        .context("opening a pty")?;
+    let size = inherited_size();
+    let pty = native_pty_system().openpty(size).context("opening a pty")?;
+    let (cols, rows) = (size.cols as usize, size.rows as usize);
+    let screen: SharedScreen = Arc::new(Mutex::new(Screen::new(cols, rows)));
 
     let mut builder = CommandBuilder::new(&command.program);
     builder.args(&command.args);
@@ -52,7 +55,7 @@ pub fn run(command: &Command) -> Result<u32> {
 
     // Registered before raw mode is entered: a signal arriving in between would
     // otherwise hit the default disposition and leave the terminal raw.
-    watch_signals(Arc::clone(&master)).context("watching for signals")?;
+    watch_signals(Arc::clone(&master), Arc::clone(&screen)).context("watching for signals")?;
     let _raw = RawMode::enable();
 
     // Detached: this read blocks, and the child exiting must not wait on a keystroke.
@@ -69,8 +72,9 @@ pub fn run(command: &Command) -> Result<u32> {
         }
     });
 
-    let mut stdout = std::io::stdout();
-    pump(&mut from_child, &mut stdout);
+    let mut tap = Tap::new(std::io::stdout(), screen);
+    pump(&mut from_child, &mut tap);
+    tap.log_final_grid();
 
     let status = child.wait().context("waiting for the wrapped command");
     // The wrapped program's terminal dies with this handle, so it is held until
@@ -105,13 +109,20 @@ fn signal_name(signal: i32) -> Option<String> {
 /// A resize the wrapped program never hears about leaves it drawing to the old
 /// geometry, and a signal death skips every destructor — including the one that
 /// takes the terminal back out of raw mode, which otherwise outlives us.
-fn watch_signals(master: Master) -> Result<()> {
+fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
     let mut signals = Signals::new([SIGWINCH, SIGHUP, SIGINT, SIGTERM])?;
     std::thread::spawn(move || {
         for signal in signals.forever() {
             if signal == SIGWINCH {
+                let size = inherited_size();
+                // Before the child hears about it: the master resize is what
+                // triggers its repaint, and a repaint parsed against the old
+                // geometry wraps in the wrong places for good.
+                if let Ok(mut screen) = screen.lock() {
+                    screen.resize(size.cols as usize, size.rows as usize);
+                }
                 if let Ok(master) = master.lock() {
-                    let _ = master.resize(inherited_size());
+                    let _ = master.resize(size);
                 }
             } else {
                 restore_terminal();
