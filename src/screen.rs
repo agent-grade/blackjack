@@ -659,6 +659,28 @@ mod tests {
         assert_eq!(screen.line(0), "a       b       c");
     }
 
+    /// A real Claude Code frame, captured through the wrapper at 40x100: the
+    /// bytes are what the terminal saw. The pinned rows are the ones a painter
+    /// has to find — the header drawn once, the input line redrawn on every
+    /// keystroke, and the mode line under it.
+    #[test]
+    fn reconstructs_a_captured_claude_code_frame() {
+        let mut screen = Screen::new(100, 40);
+        vte::Parser::new().advance(
+            &mut screen,
+            include_bytes!("../tests/fixtures/claude-tui-40x100.bin"),
+        );
+        assert_eq!(screen.line(1), " ▐▛███▛█   Claude Code v2.1.259");
+        assert_eq!(screen.line(35), "─".repeat(100));
+        assert_eq!(screen.line(36), "❯");
+        assert_eq!(screen.line(37), "─".repeat(100));
+        assert_eq!(
+            screen.line(39),
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+        );
+        assert_eq!(screen.cursor(), (36, 2));
+    }
+
     #[test]
     fn resizing_keeps_what_still_fits() {
         let mut screen = screen(10, 3, b"abcdefgh\r\nsecond");
