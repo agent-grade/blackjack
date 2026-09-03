@@ -4,6 +4,7 @@ use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 const TAB_STOP: usize = 8;
+const ALTERNATE_SCREEN: u16 = 1049;
 /// Written into the second cell of a double-width character, so that the cells a
 /// character occupies and the columns it covers stay the same count.
 const CONTINUATION: char = '\0';
@@ -26,6 +27,22 @@ pub struct Screen {
     /// scrolls the screen on every full line the program merely finished.
     wrap_pending: bool,
     saved: (usize, usize),
+    /// The inclusive row bounds scrolling is confined to. A TUI sets them to
+    /// hold a header or a status line still; scrolling the whole grid instead
+    /// corrupts every row outside them, from code that reads as correct.
+    margins: (usize, usize),
+    /// The main grid, held aside while the program draws on the alternate
+    /// screen. Without it that drawing lands on the model of the main screen
+    /// and destroys it, with nothing left to restore from.
+    main: Option<MainScreen>,
+}
+
+/// What `CSI ? 1049 h` puts aside and `CSI ? 1049 l` gives back.
+struct MainScreen {
+    cells: Vec<char>,
+    row: usize,
+    col: usize,
+    saved: (usize, usize),
 }
 
 impl Screen {
@@ -39,6 +56,8 @@ impl Screen {
             col: 0,
             wrap_pending: false,
             saved: (0, 0),
+            margins: (0, rows - 1),
+            main: None,
         }
     }
 
@@ -50,18 +69,18 @@ impl Screen {
         if (cols, rows) == (self.cols, self.rows) {
             return;
         }
-        let mut cells = vec![' '; cols * rows];
-        for row in 0..rows.min(self.rows) {
-            for col in 0..cols.min(self.cols) {
-                cells[row * cols + col] = self.cells[row * self.cols + col];
-            }
+        self.cells = reshape(&self.cells, (self.cols, self.rows), (cols, rows));
+        if let Some(main) = &mut self.main {
+            main.cells = reshape(&main.cells, (self.cols, self.rows), (cols, rows));
         }
-        self.cells = cells;
         self.cols = cols;
         self.rows = rows;
         self.row = self.row.min(rows - 1);
         self.col = self.col.min(cols - 1);
         self.wrap_pending = false;
+        // A margin from the old shape can name a row this one does not have,
+        // and a terminal drops the region on a resize anyway.
+        self.margins = (0, rows - 1);
     }
 
     /// Zero-based `(row, column)`, in display columns rather than characters.
@@ -89,22 +108,68 @@ impl Screen {
     }
 
     fn index(&mut self) {
-        if self.row + 1 == self.rows {
-            self.cells.rotate_left(self.cols);
-            let last = (self.rows - 1) * self.cols;
-            self.cells[last..].fill(' ');
-        } else {
+        let (top, bottom) = self.margins;
+        if self.row == bottom {
+            let (start, end) = self.region(top, bottom);
+            self.cells[start..end].rotate_left(self.cols);
+            self.cells[end - self.cols..end].fill(' ');
+        } else if self.row + 1 < self.rows {
+            // Nothing scrolls a cursor parked below the region off the last row.
             self.row += 1;
         }
     }
 
     fn reverse_index(&mut self) {
-        if self.row == 0 {
-            self.cells.rotate_right(self.cols);
-            self.cells[..self.cols].fill(' ');
-        } else {
+        let (top, bottom) = self.margins;
+        if self.row == top {
+            let (start, end) = self.region(top, bottom);
+            self.cells[start..end].rotate_right(self.cols);
+            self.cells[start..start + self.cols].fill(' ');
+        } else if self.row > 0 {
             self.row -= 1;
         }
+    }
+
+    fn region(&self, top: usize, bottom: usize) -> (usize, usize) {
+        (top * self.cols, (bottom + 1) * self.cols)
+    }
+
+    fn set_margins(&mut self, params: &Params) {
+        let top = count(params, 0) - 1;
+        let bottom = match param_as_written(params, 1) {
+            0 => self.rows - 1,
+            row => (row as usize - 1).min(self.rows - 1),
+        };
+        // A region a terminal would reject leaves the current one standing.
+        if top >= bottom {
+            return;
+        }
+        self.margins = (top, bottom);
+        self.move_to(0, 0);
+    }
+
+    fn enter_alternate(&mut self) {
+        if self.main.is_some() {
+            return;
+        }
+        // The cursor stays where it was: the program positions itself before it
+        // draws on a screen that starts empty.
+        let blank = vec![' '; self.cols * self.rows];
+        self.main = Some(MainScreen {
+            cells: std::mem::replace(&mut self.cells, blank),
+            row: self.row,
+            col: self.col,
+            saved: std::mem::take(&mut self.saved),
+        });
+    }
+
+    fn leave_alternate(&mut self) {
+        let Some(main) = self.main.take() else {
+            return;
+        };
+        self.cells = main.cells;
+        self.saved = main.saved;
+        self.move_to(main.row, main.col);
     }
 
     fn move_to(&mut self, row: usize, col: usize) {
@@ -177,14 +242,30 @@ impl Perform for Screen {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        // An intermediate or a private marker makes a different sequence of the
-        // same final byte — `CSI SP A` scrolls right where `CSI A` moves up, and
-        // `CSI ? J` is the selective erase. `ignore` is vte's own verdict on a
-        // sequence past 32 parameters, and it arrives with no intermediate.
-        //
-        // What dropping the whole class costs is the alternate screen
-        // (`CSI ? 1049 h`), which this model keeps no second buffer for.
-        if !intermediates.is_empty() || ignore {
+        // `ignore` is vte's own verdict on a sequence past 32 parameters, and a
+        // terminal discards those.
+        if ignore {
+            return;
+        }
+        // A private marker makes a different sequence of the same final byte —
+        // `CSI ? J` is the selective erase — and of the modes a TUI toggles on
+        // every redraw, only the alternate screen moves cells.
+        if intermediates == b"?" {
+            if params
+                .iter()
+                .any(|param| param.first() == Some(&ALTERNATE_SCREEN))
+            {
+                match action {
+                    'h' => self.enter_alternate(),
+                    'l' => self.leave_alternate(),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        // An intermediate does the same — `CSI SP A` scrolls right where
+        // `CSI A` moves up.
+        if !intermediates.is_empty() {
             return;
         }
         match action {
@@ -199,6 +280,7 @@ impl Perform for Screen {
             'H' | 'f' => self.move_to(count(params, 0) - 1, count(params, 1) - 1),
             'J' => self.erase_in_display(param_as_written(params, 0)),
             'K' => self.erase_in_line(param_as_written(params, 0)),
+            'r' => self.set_margins(params),
             's' => self.saved = (self.row, self.col),
             'u' => self.move_to(self.saved.0, self.saved.1),
             _ => {}
@@ -227,6 +309,17 @@ impl Perform for Screen {
             _ => {}
         }
     }
+}
+
+fn reshape(cells: &[char], from: (usize, usize), to: (usize, usize)) -> Vec<char> {
+    let ((old_cols, old_rows), (cols, rows)) = (from, to);
+    let mut reshaped = vec![' '; cols * rows];
+    for row in 0..rows.min(old_rows) {
+        for col in 0..cols.min(old_cols) {
+            reshaped[row * cols + col] = cells[row * old_cols + col];
+        }
+    }
+    reshaped
 }
 
 /// A parameter as written, so that a sequence whose zero means something (the
@@ -373,9 +466,151 @@ mod tests {
     /// redraw.
     #[test]
     fn a_marked_sequence_is_not_the_plain_one_it_ends_like() {
-        let screen = screen(10, 3, b"ab\x1b[?25l\x1b[?1049h\x1b[2;3H\x1b[ A\x1b[2 qc");
+        let screen = screen(10, 3, b"ab\x1b[?25l\x1b[?2004h\x1b[2;3H\x1b[ A\x1b[2 qc");
         assert_eq!(screen.cursor(), (1, 3));
+        assert_eq!(screen.line(0), "ab", "a mode toggle moved cells");
         assert_eq!(screen.line(1), "  c");
+    }
+
+    /// The one private mode that does move cells. Claude Code emits it, and
+    /// without it the alt-screen drawing lands on the main model and stays.
+    #[test]
+    fn the_alternate_screen_keeps_its_drawing_off_the_main_grid() {
+        let screen = screen(10, 3, b"main text\x1b[?1049h\x1b[2Jfull\x1b[?1049l");
+        assert_eq!(screen.line(0), "main text");
+        assert_eq!(screen.cursor(), (0, 9));
+    }
+
+    #[test]
+    fn the_alternate_screen_starts_empty() {
+        let screen = screen(10, 2, b"main\x1b[?1049h");
+        assert_eq!(screen.render(), "\n");
+    }
+
+    /// A program clearing its modes at startup emits the exit with no entry.
+    #[test]
+    fn leaving_an_alternate_screen_never_entered_changes_nothing() {
+        let screen = screen(10, 2, b"main\x1b[?1049l");
+        assert_eq!(screen.line(0), "main");
+    }
+
+    /// The save slot travels with the buffer, as it does in xterm: an editor
+    /// saving its own cursor on the alternate screen must not be what the
+    /// shell's restore finds waiting for it.
+    #[test]
+    fn a_cursor_saved_on_the_alternate_screen_stays_there() {
+        let screen = screen(
+            10,
+            4,
+            b"\x1b[3;1H\x1b7\x1b[?1049h\x1b[1;5H\x1b7\x1b[?1049l\x1b8x",
+        );
+        assert_eq!(screen.line(2), "x");
+        assert_eq!(screen.cursor(), (2, 1));
+    }
+
+    /// Nothing scrolls a cursor below the region, so the row must stay on the
+    /// grid on its own — a TUI holding a status line puts it exactly there.
+    #[test]
+    fn a_wrap_below_the_scroll_region_stays_on_the_last_row() {
+        let screen = screen(4, 4, b"\x1b[1;3r\x1b[4;1Habcde");
+        assert_eq!(screen.line(3), "ebcd", "the wrap left the last row");
+        assert_eq!(screen.cursor(), (3, 1));
+    }
+
+    #[test]
+    fn a_reverse_index_above_the_scroll_region_stays_on_the_first_row() {
+        let screen = screen(10, 4, b"\x1b[2;4r\x1bMx");
+        assert_eq!(screen.line(0), "x");
+        assert_eq!(screen.cursor(), (0, 1));
+    }
+
+    /// One `CSI ? … h` may carry several modes; tmux sets its mouse modes that
+    /// way.
+    #[test]
+    fn a_combined_mode_set_still_finds_the_alternate_screen() {
+        let screen = screen(10, 2, b"main\x1b[?1000;1049h");
+        assert_eq!(screen.render(), "\n");
+    }
+
+    #[test]
+    fn a_second_entry_does_not_displace_the_saved_main_grid() {
+        let screen = screen(
+            10,
+            2,
+            b"main\x1b[?1049h\x1b[2Jfirst\x1b[?1049h\x1b[2Jsecond\x1b[?1049l",
+        );
+        assert_eq!(screen.line(0), "main");
+    }
+
+    /// The saved grid is a grid too: kept at the old shape, restoring it reads
+    /// past the end of a screen that has since grown.
+    #[test]
+    fn a_resize_reaches_the_grid_held_behind_the_alternate_screen() {
+        let mut screen = screen(10, 2, b"mainline\x1b[?1049h");
+        screen.resize(20, 3);
+        vte::Parser::new().advance(&mut screen, b"\x1b[?1049l");
+        assert_eq!(screen.line(0), "mainline");
+        assert_eq!(screen.line(2), "");
+    }
+
+    /// `CSI 2;3r` over four rows: a line feed at the bottom of the region
+    /// scrolls those two rows and leaves the header and footer standing.
+    #[test]
+    fn a_scroll_region_scrolls_only_its_own_rows() {
+        let screen = screen(
+            10,
+            4,
+            b"\x1b[2;3rhead\x1b[2;1Hone\x1b[3;1Htwo\x1b[4;1Hfoot\x1b[3;4H\n",
+        );
+        assert_eq!(screen.line(0), "head");
+        assert_eq!(screen.line(1), "two");
+        assert_eq!(screen.line(2), "");
+        assert_eq!(screen.line(3), "foot");
+        assert_eq!(screen.cursor(), (2, 3));
+    }
+
+    #[test]
+    fn a_reverse_index_scrolls_only_the_region_it_is_in() {
+        let screen = screen(
+            10,
+            4,
+            b"\x1b[2;3rhead\x1b[2;1Hone\x1b[3;1Htwo\x1b[4;1Hfoot\x1b[2;1H\x1bM",
+        );
+        assert_eq!(screen.line(0), "head");
+        assert_eq!(screen.line(1), "");
+        assert_eq!(screen.line(2), "one");
+        assert_eq!(screen.line(3), "foot");
+    }
+
+    #[test]
+    fn setting_a_scroll_region_homes_the_cursor() {
+        let screen = screen(10, 4, b"\x1b[4;5H\x1b[2;3rx");
+        assert_eq!(screen.line(0), "x");
+    }
+
+    #[test]
+    fn an_inverted_region_leaves_the_whole_screen_scrolling() {
+        let screen = screen(10, 3, b"\x1b[3;2rone\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(screen.line(0), "two");
+        assert_eq!(screen.line(2), "four");
+    }
+
+    #[test]
+    fn a_bare_region_reset_restores_the_whole_screen() {
+        let screen = screen(10, 3, b"\x1b[2;3r\x1b[rone\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(screen.line(0), "two");
+        assert_eq!(screen.line(2), "four");
+    }
+
+    /// A region naming rows the new shape does not have would otherwise sit
+    /// there unreachable, and nothing would ever scroll again.
+    #[test]
+    fn a_resize_drops_the_scroll_region() {
+        let mut screen = screen(10, 4, b"\x1b[3;4r");
+        screen.resize(10, 2);
+        vte::Parser::new().advance(&mut screen, b"\x1b[1;1Ha\r\nb\r\nc");
+        assert_eq!(screen.line(0), "b");
+        assert_eq!(screen.line(1), "c");
     }
 
     /// vte reports a sequence past 32 parameters by setting `ignore`, with no
