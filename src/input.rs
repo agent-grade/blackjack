@@ -123,8 +123,11 @@ struct Buffer {
     /// So that the line feed of a CRLF is read as part of that one ending.
     /// Anything typed since the return ends the pairing.
     after_return: bool,
-    /// Between `CSI 200~` and `CSI 201~` the bytes are a paste, not typing.
-    /// Counting them would reconstruct a line nobody wrote.
+    /// Between `CSI 200~` and `CSI 201~` the bytes are a paste. Its printable
+    /// characters are text of the line, and so are the tabs and line endings
+    /// the terminal let through; every other control byte is dropped, because
+    /// the box holds none of them, and the chords an escape sequence in the
+    /// body would spell were never pressed.
     pasting: bool,
     /// SS3 (`ESC O`, how an arrow arrives without the kitty protocol) shifts
     /// exactly the next character out of the text — and the parser reports the
@@ -241,7 +244,7 @@ impl Buffer {
 impl Perform for Buffer {
     fn print(&mut self, c: char) {
         self.after_return = false;
-        if self.pasting || std::mem::take(&mut self.shifted) {
+        if std::mem::take(&mut self.shifted) {
             return;
         }
         if c == DEL {
@@ -252,10 +255,22 @@ impl Perform for Buffer {
     }
 
     fn execute(&mut self, byte: u8) {
+        let after_return = std::mem::take(&mut self.after_return);
         if self.pasting {
+            // The input box takes more than one line and renders a tab, so both
+            // are text of the pasted line rather than the keys they would be.
+            // A `\0` would collide with the screen model's own sentinel.
+            match byte {
+                0x09 => self.insert('\t'),
+                0x0d => {
+                    self.insert('\n');
+                    self.after_return = true;
+                }
+                0x0a if !after_return => self.insert('\n'),
+                _ => {}
+            }
             return;
         }
-        let after_return = std::mem::take(&mut self.after_return);
         match byte {
             0x0d => {
                 self.submit();
@@ -278,9 +293,19 @@ impl Perform for Buffer {
             return;
         }
         if action == '~' {
+            // A line ending never straddles the bracket — the terminal sends the
+            // whole body before closing it — and a shift owed from before the
+            // paste is not owed to a character inside it.
             match param_as_written(params, 0) {
-                200 => return self.pasting = true,
-                201 => return self.pasting = false,
+                200 => {
+                    self.after_return = false;
+                    self.shifted = false;
+                    return self.pasting = true;
+                }
+                201 => {
+                    self.after_return = false;
+                    return self.pasting = false;
+                }
                 _ => {}
             }
         }
@@ -477,21 +502,89 @@ mod tests {
         assert_eq!(typed(&[b"ab\x1bOAcd"]).line(), "abcd");
     }
 
-    /// The shift is owed to a character, and inside a paste no character comes
-    /// to claim it — so it would be spent on the first one typed afterwards.
+    /// SS3 inside a paste sets no shift, or the very next pasted character would
+    /// claim it and be eaten. The `A` stays in the line: once the parser has
+    /// taken `ESC O`, its final byte is an ordinary printable — and no terminal
+    /// sends an escape through a paste filter anyway.
     #[test]
     fn a_shift_inside_a_paste_does_not_outlive_it() {
-        assert_eq!(typed(&[b"\x1b[200~\x1bOA\x1b[201~hello"]).line(), "hello");
+        assert_eq!(typed(&[b"\x1b[200~\x1bOA\x1b[201~hello"]).line(), "Ahello");
     }
 
-    /// A paste is not typing. Counting its body here would
-    /// reconstruct a line the user never wrote — submissions and edits included,
-    /// since a pasted `\r` and a pasted DEL are ordinary bytes.
+    /// A paste is text and not keys: the body goes into the line, while the
+    /// chords inside it were never pressed and do nothing.
     #[test]
-    fn a_paste_is_skipped_whole() {
-        let mut input = typed(&[b"ab\x1b[200~pasted\r\x7f\x1b[3~text\x1b[201~cd"]);
-        assert_eq!(input.line(), "abcd");
+    fn a_paste_is_text_and_the_keys_inside_it_are_not() {
+        let mut input = typed(&[b"ab\x1b[200~pasted\x7f\x1b[3~text\x1b[201~cd"]);
+        assert_eq!(input.line(), "abpastedtextcd");
         assert_eq!(input.take_events(), vec![]);
+    }
+
+    #[test]
+    fn a_paste_lands_where_the_cursor_is() {
+        let input = typed(&[b"ac\x1b[D\x1b[200~b\x1b[201~"]);
+        assert_eq!(input.line(), "abc");
+        assert_eq!(input.cursor(), 2);
+    }
+
+    #[test]
+    fn a_multi_line_paste_keeps_its_line_breaks_and_submits_once() {
+        let mut input = typed(&[b"\x1b[200~one\rtwo\n\x1b[201~\r"]);
+        assert_eq!(input.take_events(), vec![submit("one\ntwo\n", false)]);
+    }
+
+    /// Pasted code is indented and the terminal sends the tab through, so
+    /// dropping it would leave the line short of the box for the rest of that
+    /// line.
+    /// The pairing is between a return and the line feed that closes it, and a
+    /// bracket comes between them: the terminal sends a whole paste body before
+    /// it closes one, so a break on either side of a bracket is its own.
+    #[test]
+    fn a_line_ending_does_not_pair_across_a_paste_bracket() {
+        assert_eq!(typed(&[b"ab\r\x1b[200~\ncd\x1b[201~"]).line(), "\ncd");
+        let mut piped_in = piped(true, &[b"\x1b[200~x\r\x1b[201~\nnext\n"]);
+        assert_eq!(
+            piped_in.take_events(),
+            vec![submit("x\n", false), submit("next", false)]
+        );
+    }
+
+    /// A shift owed from before a paste is not owed to a character inside it,
+    /// or the body would pay it and arrive without its first character.
+    #[test]
+    fn a_shift_does_not_outlive_the_start_of_a_paste() {
+        assert_eq!(typed(&[b"\x1bO\x1b[200~Ab\x1b[201~"]).line(), "Ab");
+    }
+
+    #[test]
+    fn a_pasted_tab_is_a_character_of_the_line() {
+        let input = typed(&[b"\x1b[200~if x:\r\tpass\x1b[201~"]);
+        assert_eq!(input.line(), "if x:\n\tpass");
+    }
+
+    /// A clipboard from Windows or a browser carries CRLF, and the box shows
+    /// one break for it — counting two would run the cursor ahead of what the
+    /// user is looking at.
+    #[test]
+    fn a_pasted_crlf_is_one_line_break() {
+        let input = typed(&[b"\x1b[200~one\r\ntwo\x1b[201~"]);
+        assert_eq!(input.line(), "one\ntwo");
+        assert_eq!(input.cursor(), 7);
+    }
+
+    #[test]
+    fn a_paste_of_several_characters_lands_where_the_cursor_is() {
+        let input = typed(&[b"ad\x1b[D\x1b[200~bc\x1b[201~"]);
+        assert_eq!(input.line(), "abcd");
+        assert_eq!(input.cursor(), 3);
+    }
+
+    /// A read ends wherever it ends, so a paste outlives the one it started in
+    /// — the opening bracket included.
+    #[test]
+    fn a_paste_split_across_two_reads_arrives_whole() {
+        let mut input = typed(&[b"\x1b[20", b"0~one", b"\rtwo\x1b[201~\r"]);
+        assert_eq!(input.take_events(), vec![submit("one\ntwo", false)]);
     }
 
     #[test]
