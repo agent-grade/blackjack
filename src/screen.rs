@@ -324,7 +324,7 @@ fn reshape(cells: &[char], from: (usize, usize), to: (usize, usize)) -> Vec<char
 
 /// A parameter as written, so that a sequence whose zero means something (the
 /// erase modes) can tell it from an omitted one.
-fn param_as_written(params: &Params, index: usize) -> u16 {
+pub fn param_as_written(params: &Params, index: usize) -> u16 {
     params
         .iter()
         .nth(index)

@@ -1,4 +1,5 @@
 mod cli;
+mod input;
 mod pty;
 mod screen;
 mod tap;

@@ -10,7 +10,7 @@ use signal_hook::iterator::Signals;
 
 use crate::cli::Command;
 use crate::screen::{Screen, SharedScreen};
-use crate::tap::Tap;
+use crate::tap::{InputTap, Log, Tap};
 
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 const BUF_LEN: usize = 8192;
@@ -52,6 +52,7 @@ pub fn run(command: &Command) -> Result<u32> {
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
     let piped_stdin = !std::io::stdin().is_terminal();
+    let log = Log::open();
 
     // Registered before raw mode is entered: a signal arriving in between would
     // otherwise hit the default disposition and leave the terminal raw.
@@ -59,9 +60,11 @@ pub fn run(command: &Command) -> Result<u32> {
     let _raw = RawMode::enable();
 
     // Detached: this read blocks, and the child exiting must not wait on a keystroke.
+    let typed = log.clone();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
-        pump(&mut stdin, &mut *to_child);
+        let mut to_child = InputTap::new(&mut *to_child, typed, piped_stdin);
+        pump(&mut stdin, &mut to_child);
         if piped_stdin {
             // The first EOT flushes a partial line, the second ends the input.
             // Only for piped stdin: on a terminal, stdin ending means the
@@ -72,7 +75,7 @@ pub fn run(command: &Command) -> Result<u32> {
         }
     });
 
-    let mut tap = Tap::new(std::io::stdout(), screen);
+    let mut tap = Tap::new(std::io::stdout(), screen, log);
     pump(&mut from_child, &mut tap);
     tap.log_final_grid();
 
