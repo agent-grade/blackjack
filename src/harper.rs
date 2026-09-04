@@ -1,5 +1,4 @@
-//! Nothing in the wrapper calls a checker yet; painting is what will.
-#![allow(dead_code)]
+//! The engine behind the checker the painter holds. Named nowhere else.
 
 use std::path::Path;
 use std::sync::Arc;

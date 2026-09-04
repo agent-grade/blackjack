@@ -1,5 +1,4 @@
-//! Nothing in the wrapper reads the config yet; painting is what will.
-#![allow(dead_code)]
+//! What the user can tune about the checking, read once at the start.
 
 use std::ffi::OsString;
 use std::fs;
@@ -61,7 +60,7 @@ impl Config {
 
     /// The configured engine. The wrapper asks for a checker and never learns
     /// which one it got, which is the whole point of the trait.
-    pub fn checker(&self) -> Box<dyn Checker> {
+    pub fn checker(&self) -> Box<dyn Checker + Send> {
         Box::new(HarperChecker::new(&self.grammar, self.dict_path.as_deref()))
     }
 

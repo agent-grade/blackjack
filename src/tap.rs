@@ -2,11 +2,12 @@ use std::fmt::Arguments;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::input::{Event, SharedInput};
 use crate::painter::Painter;
 use crate::parser::Parser;
-use crate::screen::SharedScreen;
+use crate::screen::{Line, SharedScreen};
 
 const LOG_VAR: &str = "BLACKJACK_DEBUG_LOG";
 
@@ -37,6 +38,15 @@ impl Log {
             let _ = writeln!(file, "{line}");
         }
     }
+}
+
+/// One reading of the screen: the line the last frame left, where the program
+/// is holding its cursor, and whether it has a frame open right now. Read apart
+/// they can come from two different shapes of the screen.
+struct Look {
+    line: Option<Line>,
+    cursor: (usize, usize),
+    mid_frame: bool,
 }
 
 /// The wrapped program's output on its way to the terminal, with a copy fed to
@@ -81,28 +91,77 @@ impl<W: Write> Tap<W> {
     /// typing is only the frame being older than the keystrokes, so that one is
     /// left alone; a key the model could not apply is not, and asks for the
     /// correction outright. What counts as a disagreement is the input model's
-    /// to say — it reads the screen's account of the line before comparing it —
-    /// and it covers the cursor, which nothing else ever reopens.
-    fn resync(&mut self, frame_line: Option<(String, usize)>) {
+    /// to say, and it covers the cursor, which nothing else ever reopens. The
+    /// line it read the screen's account as goes on to the painter either way:
+    /// corrected or not, that is the line the user typed.
+    fn resync(&mut self, frame_line: Option<Line>) -> Option<Line> {
         let Ok(mut input) = self.input.lock() else {
-            return;
+            return None;
         };
         // Taken on every frame, box or none, or a keystroke from an older frame
         // eats the first correction the box comes back for.
         let raced = input.raced_the_frame();
-        let Some((text, cursor)) = frame_line else {
-            return;
-        };
-        if !input.stale() && raced {
-            return;
-        }
-        if input.resync(text, cursor) {
+        let typed = input.rejoin(&frame_line?);
+        if (input.stale() || !raced) && input.resync(&typed) {
             self.log.line(format_args!(
                 "resync \"{}\" @{}",
                 escape(input.line().as_bytes()),
                 input.cursor()
             ));
         }
+        Some(typed)
+    }
+
+    /// The wrapped program has gone quiet and the painter's own clock has run
+    /// out. Nothing has closed a frame, so the input model is left alone —
+    /// there is nothing new for the screen to correct it against — and the line
+    /// the last frame left is read again, which is the one that has been held
+    /// still long enough to be worth checking.
+    pub fn tick(&mut self) {
+        let Some(mut look) = self.look() else {
+            return;
+        };
+        let Some(line) = look.line.take() else {
+            return;
+        };
+        let typed = {
+            let Ok(input) = self.input.lock() else {
+                return;
+            };
+            input.rejoin(&line)
+        };
+        self.paint(Some(&typed), &look);
+    }
+
+    /// One look at the screen for all of it: a resize lands on another thread,
+    /// so reading the line at one shape and the paint's coordinates at another
+    /// would underline a place neither shape has.
+    fn look(&self) -> Option<Look> {
+        let screen = self.screen.lock().ok()?;
+        Some(Look {
+            line: screen.frame_line(),
+            cursor: screen.cursor(),
+            mid_frame: screen.mid_frame(),
+        })
+    }
+
+    fn paint(&mut self, line: Option<&Line>, look: &Look) {
+        let Some(paint) = self.painter.paint(line, look.cursor, look.mid_frame) else {
+            return;
+        };
+        // Written past the parser, so the model of the screen the program
+        // believes it is drawing on is never told about it; and a paint that
+        // will not go is dropped rather than failing output that has already
+        // landed.
+        let _ = self.out.write_all(&paint);
+        let _ = self.out.flush();
+        self.log.line(format_args!("paint {}B", paint.len()));
+    }
+
+    /// How long this tap may wait on the wrapped program before it has
+    /// something to draw on its own.
+    pub fn wake_in(&self) -> Option<Duration> {
+        self.painter.wake_in()
     }
 
     /// The grid as the wrapped program left it — what a real session can be
@@ -126,9 +185,6 @@ impl<W: Write> Tap<W> {
 impl<W: Write> Write for Tap<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.out.write(buf)?;
-        // One look at the screen for all of it: a resize lands on another
-        // thread, so reading the line at one shape and the paint's coordinates
-        // at another would underline a place neither shape has.
         let ended = {
             let Ok(mut screen) = self.screen.lock() else {
                 return Ok(written);
@@ -138,22 +194,19 @@ impl<W: Write> Write for Tap<W> {
             self.log
                 .line(format_args!("out {written}B -> cursor {row},{col}"));
             let frames = screen.frames();
-            (std::mem::replace(&mut self.frames, frames) != frames)
-                .then(|| (screen.frame_line(), self.painter.paint(&screen)))
+            let closed = frames != self.frames;
+            self.frames = frames;
+            closed.then(|| Look {
+                line: screen.frame_line(),
+                cursor: (row, col),
+                mid_frame: screen.mid_frame(),
+            })
         };
-        let Some((frame_line, paint)) = ended else {
+        let Some(mut look) = ended else {
             return Ok(written);
         };
-        self.resync(frame_line);
-        if let Some(paint) = paint {
-            // Written past the parser, so the model of the screen the program
-            // believes it is drawing on is never told about it; and a paint
-            // that will not go is dropped rather than failing output that has
-            // already landed.
-            let _ = self.out.write_all(&paint);
-            let _ = self.out.flush();
-            self.log.line(format_args!("paint {}B", paint.len()));
-        }
+        let typed = self.resync(look.line.take());
+        self.paint(typed.as_ref(), &look);
         Ok(written)
     }
 
@@ -232,6 +285,7 @@ fn escape(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checker::Checker;
     use crate::screen::Screen;
 
     fn shared_input() -> SharedInput {
@@ -253,6 +307,63 @@ mod tests {
             "\x1b[1;1H\u{2500}\u{2500}\u{2500}\x1b[2;1H\u{276f}\u{a0}{text}\x1b[3;1H\u{2500}\u{2500}\u{2500}\x1b[2;{}H\x1b[?2026l",
             cursor + 3
         )
+    }
+
+    /// The box wrapping one line onto two rows: the row above ends where the
+    /// box broke it, the row below carries the rest, and the cursor is left
+    /// where the program is holding it.
+    fn wrapped(above: &str, below: &str, cursor: (usize, usize)) -> String {
+        format!(
+            "\x1b[1;1H\u{2500}\u{2500}\u{2500}\x1b[2;1H\u{276f}\u{a0}{above}\x1b[3;1H  {below}\x1b[4;1H\u{2500}\u{2500}\u{2500}\x1b[{};{}H\x1b[?2026l",
+            cursor.0 + 1,
+            cursor.1 + 1
+        )
+    }
+
+    /// Everything the terminal received, paints included.
+    fn painted(out: &Tap<Vec<u8>>) -> String {
+        String::from_utf8_lossy(&out.out).into_owned()
+    }
+
+    /// What the underline for `teh` in a one-row box looks like on the wire.
+    const UNDERLINED: &[u8] =
+        b"\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l";
+
+    /// A tap over a box of the given shape, painting what its checker flags.
+    fn painting(
+        checker: Box<dyn Checker + Send>,
+        rows: usize,
+        input: &SharedInput,
+    ) -> Tap<Vec<u8>> {
+        let screen = Arc::new(Mutex::new(Screen::new(20, rows)));
+        Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::checking(checker),
+            Log(None),
+        )
+    }
+
+    /// The real engine behind the paint, which is the only thing that can say
+    /// whether the line the checker was handed is a line English knows.
+    fn harper(input: &SharedInput) -> Tap<Vec<u8>> {
+        painting(
+            Box::new(crate::harper::HarperChecker::new(&[], None)),
+            4,
+            input,
+        )
+    }
+
+    fn fake(flagged: &[&str]) -> Tap<Vec<u8>> {
+        let checker = Box::new(crate::checker::FakeChecker::spelling(flagged));
+        painting(checker, 3, &shared_input())
+    }
+
+    fn typed(input: &SharedInput, keys: &[u8]) {
+        InputTap::new(Vec::new(), input.clone(), Log(None))
+            .write_all(keys)
+            .expect("type");
     }
 
     /// A real session at 40x100: 115 characters typed into the box, which wraps
@@ -288,7 +399,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"\x1b[A").expect("recall");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(wrap_frames(0, 6)).expect("draw");
         assert_eq!(input.lock().expect("input").line(), TYPED);
     }
@@ -304,7 +415,7 @@ mod tests {
         keys.write_all(b"\x1b[13;2u").expect("shift+enter");
         keys.write_all(b"after\x1b[D").expect("type on");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(wrap_frames(0, 7)).expect("draw");
         out.write_all(wrap_frames(7, 8)).expect("redraw");
         let input = input.lock().expect("input");
@@ -322,7 +433,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"\x1b[A").expect("recall");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         let redrawing = [wrap_frames(0, 6), &wrap_frames(6, 7)[..80]].concat();
         out.write_all(&redrawing).expect("draw");
         let input = input.lock().expect("input");
@@ -339,7 +450,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"hi").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(b"\x1b[?2026h\x1b[2Jbusy\x1b[?2026l")
             .expect("no box");
         let redrawn = format!("\x1b[2J{}", boxed("other", 5));
@@ -365,7 +476,7 @@ mod tests {
             Vec::new(),
             screen,
             input,
-            Painter(true),
+            Painter::off(),
             Log(Some(Arc::new(Mutex::new(file)))),
         );
         out.write_all(boxed("hi", 2).as_bytes()).expect("draw");
@@ -379,18 +490,28 @@ mod tests {
 
     /// The underline is written to the terminal after the program's own frame,
     /// and past the parser: the model of the screen the program believes it is
-    /// drawing on counts one frame, not the paint's own.
+    /// drawing on counts the program's two frames and not the paint's own.
     #[test]
     fn a_misspelling_in_the_box_is_painted_after_the_frame() {
         let input = shared_input();
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen.clone(), input, Painter(true), Log(None));
+        let checker = Box::new(crate::checker::FakeChecker::spelling(&["teh"]));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen.clone(),
+            input,
+            Painter::checking(checker),
+            Log(None),
+        );
+        // The first frame is the one that changed the line; the paint is on the
+        // frame after, once there is a line that has held still.
         out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
+        out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
         let written = String::from_utf8(out.out.clone()).expect("what the terminal saw");
         assert!(written.ends_with(
             "\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l"
         ));
-        assert_eq!(screen.lock().expect("screen").frames(), 1);
+        assert_eq!(screen.lock().expect("screen").frames(), 2);
     }
 
     /// The paint goes on at the end of a frame, not at the end of a read: a
@@ -398,14 +519,83 @@ mod tests {
     /// left it.
     #[test]
     fn a_read_that_ends_no_frame_paints_nothing() {
-        let input = shared_input();
-        let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input, Painter(true), Log(None));
+        let mut out = fake(&["teh"]);
         out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
+        out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
         let painted = out.out.len();
         let home = b"\x1b[1;1H";
         out.write_all(home).expect("a read with no frame in it");
         assert_eq!(out.out.len(), painted + home.len());
+    }
+
+    /// The user stops typing and the program stops drawing: the frame that
+    /// carried the last keystroke is the one that changed the line, so nothing
+    /// is coming to paint on. The wait is the tap's own, and running it out is
+    /// what puts the underline up.
+    #[test]
+    fn a_line_nothing_redraws_is_painted_when_the_wait_runs_out() {
+        let mut out = fake(&["teh"]);
+        out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
+        assert!(!out.out.ends_with(UNDERLINED), "painted a changed line");
+        assert!(out.wake_in().is_some(), "nothing left to wait for");
+        out.tick();
+        assert!(out.out.ends_with(UNDERLINED), "{:?}", out.out);
+        assert!(out.wake_in().is_none(), "still waiting for something");
+    }
+
+    /// A word the box broke to wrap it is one word. The checker is handed the
+    /// line as the user typed it, so a real dictionary is asked about
+    /// `misspelled` rather than about the two halves of it the box is showing.
+    #[test]
+    fn a_word_the_box_broke_is_checked_whole() {
+        let input = shared_input();
+        typed(&input, b"misspelled");
+        let mut out = harper(&input);
+        out.write_all(wrapped("misspe", "lled", (2, 6)).as_bytes())
+            .expect("draw");
+        out.write_all(wrapped("misspe", "lled", (2, 6)).as_bytes())
+            .expect("redraw");
+        assert!(!painted(&out).contains("\x1b[4:3m"), "{:?}", painted(&out));
+    }
+
+    /// The box wraps at a space and does not draw it. The line the checker sees
+    /// has the space back, so the word after it is a word, and it is underlined
+    /// once — where the box is showing it, on the row it wrapped onto.
+    #[test]
+    fn a_word_after_a_wrap_is_underlined_where_the_box_wrapped_it() {
+        let input = shared_input();
+        typed(&input, b"one teh");
+        let mut out = harper(&input);
+        out.write_all(wrapped("one", "teh", (2, 5)).as_bytes())
+            .expect("draw");
+        out.write_all(wrapped("one", "teh", (2, 5)).as_bytes())
+            .expect("redraw");
+        let painted = painted(&out);
+        assert!(
+            painted.contains("\x1b[3;3H\x1b[4:3m\x1b[58:2::255:0:0mteh"),
+            "{painted:?}"
+        );
+        assert_eq!(painted.matches("\x1b[4:3m").count(), 1, "{painted:?}");
+    }
+
+    /// A break the user typed is not a wrap: it stays in the line the checker
+    /// reads, so the words either side of it stay two words rather than being
+    /// run together into one the dictionary has never heard of.
+    #[test]
+    fn a_break_the_user_typed_keeps_the_words_apart() {
+        let input = shared_input();
+        typed(&input, b"hte\x1b[13;2ucat");
+        let mut out = harper(&input);
+        out.write_all(wrapped("hte", "cat", (2, 5)).as_bytes())
+            .expect("draw");
+        out.write_all(wrapped("hte", "cat", (2, 5)).as_bytes())
+            .expect("redraw");
+        let painted = painted(&out);
+        assert!(
+            painted.contains("\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mhte"),
+            "{painted:?}"
+        );
+        assert_eq!(painted.matches("\x1b[4:3m").count(), 1, "{painted:?}");
     }
 
     /// History recall replaces the line from somewhere the input model cannot
@@ -417,7 +607,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"hi\x1b[A").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(boxed("recalled", 8).as_bytes())
             .expect("draw");
         let input = input.lock().expect("input");
@@ -434,7 +624,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"hi\x1b[D").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(boxed("hi", 1).as_bytes()).expect("draw");
         out.write_all(boxed("hi", 1).as_bytes()).expect("redraw");
         let input = input.lock().expect("input");
@@ -451,7 +641,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"ab").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(boxed("a", 1).as_bytes()).expect("draw");
         let input = input.lock().expect("input");
         assert_eq!(input.line(), "ab");
@@ -467,7 +657,7 @@ mod tests {
         let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
         keys.write_all(b"hi\x1b[D\x1b[A").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter(true), Log(None));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
         out.write_all(boxed("hi", 2).as_bytes()).expect("draw");
         assert_eq!(input.lock().expect("input").cursor(), 2);
     }
@@ -476,7 +666,7 @@ mod tests {
     fn the_output_tap_tracks_a_character_split_across_two_reads() {
         let screen = Arc::new(Mutex::new(Screen::new(10, 1)));
         let input = shared_input();
-        let mut tap = Tap::new(Vec::new(), screen.clone(), input, Painter(true), Log(None));
+        let mut tap = Tap::new(Vec::new(), screen.clone(), input, Painter::off(), Log(None));
         for read in split_reads() {
             tap.write_all(read).expect("write");
         }

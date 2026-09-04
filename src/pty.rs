@@ -1,14 +1,18 @@
 use std::io::{IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
+use crate::checker::Checker;
 use crate::cli::Command;
+use crate::config::Config;
 use crate::input::{Input, SharedInput};
 use crate::painter::Painter;
 use crate::resolve;
@@ -58,6 +62,8 @@ pub fn run(command: &Command) -> Result<u32> {
     // is an Enter the wrapped program never received, so this writer is never
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
+    let (pause, arriving) = checker_thread(Painter::wanted());
+
     let piped_stdin = !std::io::stdin().is_terminal();
     let input: SharedInput = Arc::new(Mutex::new(Input::new(piped_stdin)));
     let log = Log::open();
@@ -84,8 +90,27 @@ pub fn run(command: &Command) -> Result<u32> {
         }
     });
 
-    let mut tap = Tap::new(std::io::stdout(), screen, input, Painter::open(), log);
-    pump(&mut from_child, &mut tap);
+    let mut tap = Tap::new(
+        std::io::stdout(),
+        screen,
+        input,
+        Painter::open(pause, arriving),
+        log,
+    );
+    // The read moves to its own thread so that this one can wait on a timer as
+    // well as on the program: the underline is due a pause after the user
+    // stops typing, and a program that has finished drawing sends nothing to
+    // wake anyone with.
+    let (chunks, arriving_output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; BUF_LEN];
+        while let Ok(read) = from_child.read(&mut buf) {
+            if read == 0 || chunks.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    forward(&arriving_output, &mut tap);
     tap.log_final_grid();
 
     let status = child.wait().context("waiting for the wrapped command");
@@ -143,6 +168,46 @@ fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// A third of a second of dictionary loading, kept off the path between the
+/// user and their prompt: the wrapper was started to run a program, so the
+/// checker is built on a thread of its own and joins whenever it is ready.
+/// Switched off, none of it happens — no config is read, no dictionary is
+/// built, and the channel it would have arrived on is closed from the start.
+fn checker_thread(wanted: bool) -> (Duration, Receiver<Box<dyn Checker + Send>>) {
+    if !wanted {
+        return (Duration::ZERO, std::sync::mpsc::channel().1);
+    }
+    let config = Config::load();
+    let pause = config.pause();
+    let (built, arriving) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = built.send(config.checker());
+    });
+    (pause, arriving)
+}
+
+/// The wrapped program's output on one side and the painter's own clock on the
+/// other. A chunk is written straight through; a timeout is the painter saying
+/// its line has held still long enough to be worth checking, which is the only
+/// thing that ever happens on a screen nobody is drawing to.
+fn forward<W: Write>(chunks: &Receiver<Vec<u8>>, tap: &mut Tap<W>) {
+    loop {
+        let arriving = match tap.wake_in() {
+            Some(waiting) => chunks.recv_timeout(waiting),
+            None => chunks.recv().map_err(RecvTimeoutError::from),
+        };
+        match arriving {
+            Ok(chunk) => {
+                if tap.write_all(&chunk).is_err() || tap.flush().is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => tap.tick(),
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// Copies until either side gives out. A broken pipe here is the ordinary way
@@ -212,6 +277,20 @@ fn restore_terminal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off is off: nothing is spawned, so nothing can arrive — a channel with
+    /// no sender left is the only shape that says the dictionary was never
+    /// built rather than merely not ready yet.
+    #[test]
+    fn the_switch_builds_no_checker_at_all() {
+        let (pause, arriving) = checker_thread(false);
+
+        assert_eq!(pause, Duration::ZERO);
+        assert!(matches!(
+            arriving.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn inherits_a_reported_size() {

@@ -3,12 +3,11 @@ use std::sync::{Arc, Mutex};
 use vte::{Params, Perform};
 
 use crate::parser::Parser;
-use crate::screen::param_as_written;
+use crate::screen::{Line, param_as_written};
 
 const ESC: u8 = 0x1b;
 const DEL: char = '\u{7f}';
 const NONE: u16 = 0;
-const SHIFT: u16 = 0b1;
 const ALT: u16 = 0b10;
 const CTRL: u16 = 0b100;
 /// Caps lock and num lock ride in the modifier field beside the keys held down,
@@ -104,63 +103,70 @@ impl Input {
 
     /// Take the line from the screen. The program draws what it is really
     /// holding, so where the two disagree this model is the one that is wrong.
-    /// Answers whether the screen had anything to say that was not already
-    /// here — the comparison belongs beside the rejoining below, which is what
-    /// the screen's account has to be read through first.
-    pub fn resync(&mut self, text: String, cursor: usize) -> bool {
-        let (text, cursor) = self.rejoined(text, cursor);
+    /// Takes the screen's line as [`Input::rejoin`] hands it back, so that what
+    /// is stored and what is checked are the one reading. Answers whether the
+    /// screen had anything to say that was not already here.
+    pub fn resync(&mut self, typed: &Line) -> bool {
         let buffer = &mut self.buffer;
-        let corrected = text != buffer.text || cursor != buffer.cursor;
-        buffer.at = text
+        let corrected = typed.text != buffer.text || typed.cursor != buffer.cursor;
+        buffer.at = typed
+            .text
             .char_indices()
-            .nth(cursor)
-            .map_or(text.len(), |(at, _)| at);
-        buffer.text = text;
-        buffer.cursor = cursor;
+            .nth(typed.cursor)
+            .map_or(typed.text.len(), |(at, _)| at);
+        buffer.text.clone_from(&typed.text);
+        buffer.cursor = typed.cursor;
         buffer.stale = false;
         buffer.edited = false;
         corrected
     }
 
-    /// Every row of the box after the first is one the screen offers a break
-    /// for, and the grid draws three different things that way: a word wrapped
-    /// with the space it broke at elided, a word too long to fit broken in the
-    /// middle, and a break the user typed. Only the line being replaced tells
-    /// them apart — at that point it holds the space, nothing, or the break.
-    /// The middle case is the one that shortens what the screen handed over,
-    /// which is why the cursor comes back through here as well.
-    fn rejoined(&self, text: String, cursor: usize) -> (String, usize) {
-        // A line this model has no account of — recalled from history, or told
-        // to it by a key it could not carry out — is one whose breaks it cannot
-        // read: each stands for the space, which at least keeps words apart.
-        if self.buffer.stale {
-            return (text.replace('\n', " "), cursor);
-        }
+    /// The screen's line as the user typed it, each character still carrying
+    /// the cell it was drawn in. Every row of the box after the first is one
+    /// the screen offers a break for, and the grid draws three different things
+    /// that way: a word wrapped with the space it broke at elided, a word too
+    /// long to fit broken in the middle, and a break the user typed. Only the
+    /// line being replaced tells them apart — at that point it holds the space,
+    /// nothing, or the break. The middle case is the one that shortens what the
+    /// screen handed over, which is why the cursor comes back through here as
+    /// well; the spots come with it so that a checker reading the joined line
+    /// and a painter drawing on the grid are talking about the same characters.
+    pub fn rejoin(&self, line: &Line) -> Line {
         let mut replaced = self.buffer.text.chars().peekable();
-        let mut line = String::with_capacity(text.len());
-        let mut moved = cursor;
-        for (at, c) in text.chars().enumerate() {
-            if c != '\n' {
-                replaced.next();
-                line.push(c);
-                continue;
-            }
-            match replaced.peek() {
-                Some('\n') => line.push('\n'),
-                Some(' ') => line.push(' '),
+        let mut text = String::with_capacity(line.text.len());
+        let mut spots = Vec::with_capacity(line.spots.len());
+        let mut cursor = line.cursor;
+        for (at, character) in line.text.chars().enumerate() {
+            let kept = match (character, replaced.peek()) {
+                // A line this model has no account of — recalled from history,
+                // or told to it by a key it could not carry out — is one whose
+                // breaks it cannot read: each stands for the space, which at
+                // least keeps words apart.
+                ('\n', _) if self.buffer.stale => Some(' '),
+                ('\n', Some('\n')) => Some('\n'),
+                ('\n', Some(' ')) => Some(' '),
                 // A word the box broke: nothing was typed where it broke, so
                 // the line takes nothing — and neither does the cursor, which
                 // is counted in what the screen drew.
-                Some(_) => {
-                    moved -= usize::from(at < cursor);
-                    continue;
-                }
+                ('\n', Some(_)) => None,
                 // The screen is holding more than this model ever saw.
-                None => line.push(' '),
+                ('\n', None) => Some(' '),
+                _ => Some(character),
+            };
+            match kept {
+                Some(kept) => {
+                    text.push(kept);
+                    spots.push(line.spots.get(at).copied().flatten());
+                    replaced.next();
+                }
+                None => cursor -= usize::from(at < line.cursor),
             }
-            replaced.next();
         }
-        (line, moved)
+        Line {
+            text,
+            cursor,
+            spots,
+        }
     }
 }
 
@@ -468,9 +474,10 @@ fn sequence_key(params: &Params, action: char) -> Option<Key> {
 /// `CSI <codepoint> ; <modifiers> u`, the encoding Claude Code asks for.
 /// Backspace arrives here as 127; Delete keeps its `CSI 3~` form.
 fn kitty_key(codepoint: u16, modifiers: u16) -> Option<Key> {
-    // Enter reaches this encoding only when it is not a submit: shift+Enter
-    // breaks the line inside the box. Plain Enter stays a carriage return.
-    if codepoint == 13 && modifiers == SHIFT {
+    // Enter reaches this encoding only when it is not a submit — plain Enter
+    // stays a carriage return — so a modified one is the box's line break,
+    // whichever modifier the terminal reports it under.
+    if codepoint == 13 && modifiers != NONE {
         return Some(Key::Break);
     }
     if codepoint == 127 {
@@ -502,6 +509,16 @@ fn kitty_key(codepoint: u16, modifiers: u16) -> Option<Key> {
 mod tests {
     use super::*;
 
+    /// The screen's account of a line with no grid behind it: these are about
+    /// what the model makes of the breaks, not where the box drew them.
+    fn shown(text: &str, cursor: usize) -> Line {
+        Line {
+            text: text.into(),
+            cursor,
+            spots: Vec::new(),
+        }
+    }
+
     /// The box breaks a word too long for its width, and nothing was typed
     /// where it broke — so the line closes back up, and the cursor with it.
     #[test]
@@ -509,7 +526,8 @@ mod tests {
         let mut input = Input::new(false);
         input.feed(b"abcdefghij");
         // The screen is saying exactly what this model holds, in rows.
-        assert!(!input.resync("abcdef\nghij".into(), 11));
+        let typed = input.rejoin(&shown("abcdef\nghij", 11));
+        assert!(!input.resync(&typed));
         assert_eq!(input.line(), "abcdefghij");
         assert_eq!(input.cursor(), 10);
     }
@@ -520,7 +538,8 @@ mod tests {
     fn the_space_the_box_wrapped_at_comes_back() {
         let mut input = Input::new(false);
         input.feed(b"abc def");
-        input.resync("abc\ndef".into(), 7);
+        let typed = input.rejoin(&shown("abc\ndef", 7));
+        input.resync(&typed);
         assert_eq!(input.line(), "abc def");
     }
 
@@ -532,8 +551,24 @@ mod tests {
         let mut input = Input::new(false);
         input.feed(b"abcdef");
         input.feed(b"\x1b[A");
-        input.resync("abc\ndef".into(), 7);
+        let typed = input.rejoin(&shown("abc\ndef", 7));
+        input.resync(&typed);
         assert_eq!(input.line(), "abc def");
+    }
+
+    /// Enter with any modifier is the box's line break, not a submit: the
+    /// terminal reports the modifier it saw, and which one it was is between
+    /// the user and their keyboard.
+    #[test]
+    fn a_modified_enter_breaks_the_line_whichever_modifier_it_was() {
+        for modified in [b"\x1b[13;2u".as_slice(), b"\x1b[13;3u", b"\x1b[13;5u"] {
+            let mut input = Input::new(false);
+            input.feed(b"ab");
+            input.feed(modified);
+            input.feed(b"cd");
+            assert_eq!(input.line(), "ab\ncd");
+            assert!(input.take_events().is_empty(), "a break submitted the line");
+        }
     }
 
     /// The terminal answers on the channel the user types on — a focus report,

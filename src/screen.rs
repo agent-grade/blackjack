@@ -59,7 +59,17 @@ pub struct Screen {
     /// The input line as the frame counted above left it. A pty read ends
     /// wherever the kernel filled the buffer, so a reader that looks when its
     /// own read is done sees a half-drawn box; this is taken at the boundary.
-    frame_line: Option<(String, usize)>,
+    frame_line: Option<Line>,
+}
+
+/// The line the box is showing: its text, where the cursor sits in it counted
+/// in characters, and where each of those characters is on the grid. A break
+/// the box drew stands for a row ending and has no cell of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    pub text: String,
+    pub cursor: usize,
+    pub spots: Vec<Option<(usize, usize)>>,
 }
 
 /// What `CSI ? 1049 h` puts aside and `CSI ? 1049 l` gives back.
@@ -147,7 +157,7 @@ impl Screen {
     /// moment the box is whole. Its line breaks are the rows the box drew and
     /// not yet the ones the user typed — only the line being replaced can tell
     /// those apart, so `Input` is where they are read.
-    pub fn frame_line(&self) -> Option<(String, usize)> {
+    pub fn frame_line(&self) -> Option<Line> {
         self.frame_line.clone()
     }
 
@@ -159,9 +169,10 @@ impl Screen {
     /// does not reach, and reading it would take the rows below for the line.
     /// A cursor outside the box goes to the nearer end of the line, which is
     /// the most that can be said of it.
-    fn input_row(&self) -> Option<(String, usize)> {
+    fn read_box(&self) -> Option<Line> {
         let (first, last) = self.box_rows()?;
         let mut text = String::new();
+        let mut spots = Vec::new();
         let mut cursor = None;
         for row in first..=last {
             // The box lays its rows out inside a width of its own — the
@@ -170,6 +181,7 @@ impl Screen {
             // offers a break, and the line being replaced decides what it was.
             if row > first {
                 text.push('\n');
+                spots.push(None);
             }
             let mut end = self.written_to(row);
             if row == self.row {
@@ -179,13 +191,19 @@ impl Screen {
                 end = end.max(self.col);
             }
             let at = row * self.cols;
-            text.extend((PROMPT.len()..end).filter_map(|col| self.char_at(at + col)));
+            for col in PROMPT.len()..end {
+                if let Some(character) = self.char_at(at + col) {
+                    text.push(character);
+                    spots.push(Some((row, col)));
+                }
+            }
         }
         let end_of_line = text.chars().count();
-        Some((
+        Some(Line {
+            cursor: cursor.unwrap_or(if self.row < first { 0 } else { end_of_line }),
             text,
-            cursor.unwrap_or(if self.row < first { 0 } else { end_of_line }),
-        ))
+            spots,
+        })
     }
 
     /// The first and last row of the box: the prompt standing under a border,
@@ -201,34 +219,6 @@ impl Screen {
             .find(|&row| row == self.row || self.written_to(row) > PROMPT.len())
             .unwrap_or(first);
         Some((first, last))
-    }
-
-    /// Where a word of the line sits on the grid, as the row and the column it
-    /// starts in. A word the box broke across two rows is not found, which is
-    /// as far as one fixed word needs to go: the checker that will ask this for
-    /// real hands over positions in the line, not words to look for.
-    pub fn word_in_box(&self, word: &str) -> Option<(usize, usize)> {
-        let (first, last) = self.box_rows()?;
-        (first..=last).find_map(|row| {
-            (PROMPT.len()..self.cols)
-                .find(|&col| self.spells(row, col, word))
-                .map(|col| (row, col))
-        })
-    }
-
-    /// Whether the cells from a column on spell the word and nothing more — the
-    /// continuation of a double-width character skipped, a dim cell reading as
-    /// the blank it stands for so the placeholder is never underlined, and a
-    /// letter or a digit on either side meaning this is part of a longer word.
-    fn spells(&self, row: usize, col: usize, word: &str) -> bool {
-        let at = row * self.cols;
-        let mut cells = (at + col..at + self.cols).filter_map(|cell| self.char_at(cell));
-        let before = (PROMPT.len()..col)
-            .rev()
-            .find_map(|col| self.char_at(at + col));
-        !before.is_some_and(char::is_alphanumeric)
-            && word.chars().all(|c| cells.next() == Some(c))
-            && !cells.next().is_some_and(char::is_alphanumeric)
     }
 
     fn starts_with_prompt(&self, row: usize) -> bool {
@@ -494,7 +484,7 @@ impl Perform for Screen {
                 self.mid_frame = action == 'h';
                 if action == 'l' {
                     self.frames += 1;
-                    self.frame_line = self.input_row();
+                    self.frame_line = self.read_box();
                 }
             }
             return;
@@ -581,6 +571,11 @@ fn count(params: &Params, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two halves of the box the assertions below are about.
+    fn input_row(screen: &Screen) -> Option<(String, usize)> {
+        screen.read_box().map(|line| (line.text, line.cursor))
+    }
 
     fn screen(cols: usize, rows: usize, bytes: &[u8]) -> Screen {
         let mut screen = Screen::new(cols, rows);
@@ -923,7 +918,7 @@ mod tests {
             if screen.frames() != frames {
                 frames = screen.frames();
                 if let Some((line, cursor)) =
-                    screen.input_row().filter(|(line, _)| !line.is_empty())
+                    input_row(&screen).filter(|(line, _)| !line.is_empty())
                 {
                     lines.push((line, cursor));
                 }
@@ -967,7 +962,7 @@ mod tests {
             screen.line(36),
             "\u{276f}\u{a0}Try \"write a test for <filepath>\""
         );
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     /// A real Claude Code frame, captured through the wrapper at 40x100: the
@@ -990,7 +985,7 @@ mod tests {
             "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
         );
         assert_eq!(screen.cursor(), (36, 2));
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     /// The box is found by its prompt and not by its row — it moves down the
@@ -999,7 +994,7 @@ mod tests {
     #[test]
     fn the_input_row_is_the_prompt_row_and_the_rows_continuing_it() {
         let screen = boxed(20, 5, &["one", "  two"], "\r\nmode");
-        assert_eq!(screen.input_row(), Some(("one\ntwo".into(), 7)));
+        assert_eq!(input_row(&screen), Some(("one\ntwo".into(), 7)));
     }
 
     /// The cursor is a column on the grid and a character index in the line, and
@@ -1007,7 +1002,7 @@ mod tests {
     #[test]
     fn a_wide_character_is_two_columns_of_the_same_character() {
         let screen = boxed(20, 3, &["a\u{4e2d}b"], "\x1b[2;6H");
-        assert_eq!(screen.input_row(), Some(("a\u{4e2d}b".into(), 2)));
+        assert_eq!(input_row(&screen), Some(("a\u{4e2d}b".into(), 2)));
     }
 
     /// The rows below the first are indented to clear the prompt, and that
@@ -1017,7 +1012,7 @@ mod tests {
     fn a_row_continuing_the_line_counts_wide_characters_as_columns_too() {
         let screen = boxed(8, 4, &["abcdef", "  \u{4e2d}\u{6587}x"], "\x1b[3;7H");
         assert_eq!(
-            screen.input_row(),
+            input_row(&screen),
             Some(("abcdef\n\u{4e2d}\u{6587}x".into(), 9))
         );
     }
@@ -1028,7 +1023,7 @@ mod tests {
     #[test]
     fn every_row_continuing_the_line_offers_a_break_for_the_line_to_answer() {
         let screen = boxed(8, 4, &["abcdef", "  ghij"], "\x1b[3;7H");
-        assert_eq!(screen.input_row(), Some(("abcdef\nghij".into(), 11)));
+        assert_eq!(input_row(&screen), Some(("abcdef\nghij".into(), 11)));
     }
 
     /// The cursor is a column of one row, so what stands before it is that
@@ -1037,7 +1032,7 @@ mod tests {
     #[test]
     fn the_cursor_counts_the_row_it_is_on_and_not_the_one_under_it() {
         let screen = boxed(20, 5, &["ab   ", "  cdef"], "\x1b[2;8H");
-        assert_eq!(screen.input_row(), Some(("ab   \ncdef".into(), 5)));
+        assert_eq!(input_row(&screen), Some(("ab   \ncdef".into(), 5)));
     }
 
     /// A line the user has just broken ends in an empty row, and the cursor
@@ -1045,7 +1040,7 @@ mod tests {
     #[test]
     fn the_empty_row_the_cursor_broke_onto_stays_in_the_line() {
         let screen = boxed(20, 4, &["ab", "  "], "\x1b[3;3H");
-        assert_eq!(screen.input_row(), Some(("ab\n".into(), 3)));
+        assert_eq!(input_row(&screen), Some(("ab\n".into(), 3)));
     }
 
     /// The box is padded to the width, so a row's blanks are the program's own
@@ -1053,7 +1048,7 @@ mod tests {
     #[test]
     fn a_trailing_space_the_cursor_stands_after_stays_in_the_line() {
         let screen = boxed(20, 3, &["ab "], "\x1b[2;6H");
-        assert_eq!(screen.input_row(), Some(("ab ".into(), 3)));
+        assert_eq!(input_row(&screen), Some(("ab ".into(), 3)));
     }
 
     /// A transcript above can hold a line that starts the same way, and the box
@@ -1066,7 +1061,7 @@ mod tests {
             &["old"],
             "\r\n\u{276f}\u{a0}new\r\n\u{2500}\u{2500}\u{2500}",
         );
-        assert_eq!(screen.input_row(), Some(("new".into(), 3)));
+        assert_eq!(input_row(&screen), Some(("new".into(), 3)));
     }
 
     /// The box is a prompt row drawn under a border, so a prompt in a
@@ -1074,7 +1069,7 @@ mod tests {
     #[test]
     fn a_prompt_row_with_no_box_drawn_round_it_is_not_the_line() {
         let screen = screen(20, 3, "said\r\n\u{276f}\u{a0}old\r\nand more".as_bytes());
-        assert_eq!(screen.input_row(), None);
+        assert_eq!(input_row(&screen), None);
     }
 
     /// Without the border that closes it the box has no end, and everything
@@ -1087,7 +1082,7 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}typed\r\nmode line".as_bytes(),
         );
-        assert_eq!(screen.input_row(), None);
+        assert_eq!(input_row(&screen), None);
     }
 
     /// Claude Code draws its placeholder into the empty box dim, and nothing
@@ -1100,7 +1095,7 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[2mTry it\x1b[22m\r\n\u{2500}\u{2500}\u{2500}\x1b[2;3H".as_bytes(),
         );
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     /// A colour spells itself out in the parameters after it, and the first of
@@ -1113,7 +1108,7 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[38;5;244mabc\x1b[38;2;153;153;153mdef\r\n\u{2500}\u{2500}\u{2500}\x1b[2;9H".as_bytes(),
         );
-        assert_eq!(screen.input_row(), Some(("abcdef".into(), 6)));
+        assert_eq!(input_row(&screen), Some(("abcdef".into(), 6)));
     }
 
     /// A dim run between two bright ones is not the user's text either, and
@@ -1126,7 +1121,7 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}ab\x1b[2mcd\x1b[22mef\r\n\u{2500}\u{2500}\u{2500}\x1b[2;9H".as_bytes(),
         );
-        assert_eq!(screen.input_row(), Some(("ab  ef".into(), 6)));
+        assert_eq!(input_row(&screen), Some(("ab  ef".into(), 6)));
     }
 
     /// A terminal puts the pen back with the cursor, so a program that saves a
@@ -1139,7 +1134,7 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[2m\x1b7\x1b[22m\x1b8hint\r\n\u{2500}\u{2500}\u{2500}\x1b[2;3H".as_bytes(),
         );
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     #[test]
@@ -1149,7 +1144,7 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}ab\x1b[2mcd\x1b[22m\r\n\u{2500}\u{2500}\u{2500}\x1b[2;5H".as_bytes(),
         );
-        assert_eq!(screen.input_row(), Some(("ab".into(), 2)));
+        assert_eq!(input_row(&screen), Some(("ab".into(), 2)));
     }
 
     /// Scrolling moves the text of a row, and the dim saying whether that text
@@ -1162,7 +1157,7 @@ mod tests {
             "\x1b[3;1H\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[2mhint\x1b[22m\r\n\u{2500}\u{2500}\u{2500}\x1b[5;1H\n".as_bytes(),
         );
         assert_eq!(screen.line(2), "\u{276f}\u{a0}hint");
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     #[test]
@@ -1173,7 +1168,7 @@ mod tests {
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[2mhint\x1b[22m\r\n\u{2500}\u{2500}\u{2500}\x1b[1;1H\x1bM".as_bytes(),
         );
         assert_eq!(screen.line(2), "\u{276f}\u{a0}hint");
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     #[test]
@@ -1184,7 +1179,7 @@ mod tests {
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[2mhint\x1b[22m\r\n\u{2500}\u{2500}\u{2500}".as_bytes(),
         );
         screen.resize(10, 3);
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     /// The pen is put aside with the screen it was set on, both ways: what a
@@ -1195,7 +1190,7 @@ mod tests {
     fn the_alternate_screen_gets_its_own_pen_and_gives_the_first_one_back() {
         let leaving_main_dim = "\x1b[2m\x1b[?1049h\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}typed\r\n\u{2500}\u{2500}\u{2500}\x1b[2;8H";
         let alternate = screen(20, 3, leaving_main_dim.as_bytes());
-        assert_eq!(alternate.input_row(), Some(("typed".into(), 5)));
+        assert_eq!(input_row(&alternate), Some(("typed".into(), 5)));
         let returned = screen(20, 3, b"\x1b[?1049h\x1b[2m\x1b[?1049lx");
         assert_eq!(returned.cursor(), (0, 1));
         assert!(!returned.dim[0]);
@@ -1208,12 +1203,12 @@ mod tests {
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}\x1b[2mhint\x1b[22m\r\n\u{2500}\u{2500}\u{2500}\x1b[?1049h\x1b[1;1Hother\x1b[?1049l".as_bytes(),
         );
-        assert_eq!(screen.input_row(), Some((String::new(), 0)));
+        assert_eq!(input_row(&screen), Some((String::new(), 0)));
     }
 
     #[test]
     fn a_screen_without_the_prompt_has_no_input_row() {
-        assert_eq!(screen(20, 2, b"nothing typed here").input_row(), None);
+        assert_eq!(input_row(&screen(20, 2, b"nothing typed here")), None);
     }
 
     #[test]

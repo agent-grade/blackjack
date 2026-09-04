@@ -1,5 +1,4 @@
-//! Nothing in the wrapper calls a checker yet; painting is what will.
-#![allow(dead_code)]
+//! What the painter asks, and the shape every engine behind it answers in.
 
 use std::ops::Range;
 
