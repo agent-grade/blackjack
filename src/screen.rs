@@ -65,6 +65,13 @@ pub struct Screen {
 /// The line the box is showing: its text, where the cursor sits in it counted
 /// in characters, and where each of those characters is on the grid. A break
 /// the box drew stands for a row ending and has no cell of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    pub text: String,
+    pub cursor: usize,
+    pub spots: Vec<Option<(usize, usize)>>,
+}
+
 /// One reading of the screen: the line the last frame left, where the program
 /// is holding its cursor, and the three states a paint has to respect — a
 /// frame still open, a wrap the terminal has not committed to, and the pen the
@@ -75,13 +82,6 @@ pub struct Look {
     pub mid_frame: bool,
     pub wrap_pending: bool,
     pub dimmed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Line {
-    pub text: String,
-    pub cursor: usize,
-    pub spots: Vec<Option<(usize, usize)>>,
 }
 
 /// What `CSI ? 1049 h` puts aside and `CSI ? 1049 l` gives back.

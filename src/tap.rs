@@ -87,7 +87,7 @@ impl<W: Write> Tap<W> {
     /// corrected or not, that is the line the user typed.
     fn resync(&mut self, frame_line: Option<&Line>) -> Option<Line> {
         let Ok(mut input) = self.input.lock() else {
-            return None;
+            return frame_line.cloned();
         };
         // Taken on every frame, box or none, or a keystroke from an older frame
         // eats the first correction the box comes back for.
@@ -112,14 +112,20 @@ impl<W: Write> Tap<W> {
         let Some(look) = self.screen.lock().ok().map(|screen| screen.look()) else {
             return;
         };
-        let typed = look.line.as_ref().and_then(|line| self.rejoined(line));
+        let typed = look.line.as_ref().map(|line| self.rejoined(line));
         self.paint(typed.as_ref(), &look);
     }
 
     /// The line as the input model reads it, which is the line the user typed
-    /// rather than the one the box wrapped.
-    fn rejoined(&self, line: &Line) -> Option<Line> {
-        Some(self.input.lock().ok()?.rejoin(line))
+    /// rather than the one the box wrapped. A model that cannot be read — a
+    /// thread panicked holding it — leaves the screen's own reading standing:
+    /// it carries the box's wrapping, which is worse than the model's answer
+    /// and much better than telling the painter the box has gone.
+    fn rejoined(&self, line: &Line) -> Line {
+        match self.input.lock() {
+            Ok(input) => input.rejoin(line),
+            Err(_) => line.clone(),
+        }
     }
 
     fn paint(&mut self, line: Option<&Line>, look: &Look) {
@@ -300,7 +306,7 @@ mod tests {
 
     /// What the underline for `teh` in a one-row box looks like on the wire.
     const UNDERLINED: &[u8] =
-        b"\x1b[?2026h\x1b[0m\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l";
+        b"\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l";
 
     /// A tap over a box of the given shape, painting what its checker flags.
     fn painting(
@@ -498,9 +504,34 @@ mod tests {
         assert_eq!(out.out.len(), painted + home.len());
     }
 
+    /// A thread died holding the input model. The box is still on the screen,
+    /// so the screen's own reading of the line stands in: what the painter must
+    /// never be told is that the box has gone, which is what makes it throw
+    /// away everything it knows about the line.
+    #[test]
+    fn a_model_that_cannot_be_read_is_not_a_box_that_left() {
+        let input = shared_input();
+        let held = input.clone();
+        let died = std::thread::spawn(move || {
+            let _holding = held.lock();
+            panic!("a thread died holding the input model");
+        });
+        assert!(died.join().is_err(), "the thread was supposed to die");
+
+        let checker = Box::new(crate::checker::FakeChecker::spelling(&["teh"]));
+        let mut out = painting(checker, 3, &input);
+        out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
+        out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
+
+        assert!(out.out.ends_with(UNDERLINED), "{:?}", painted(&out));
+    }
+
     /// Whatever the paint did to the terminal, the program's cursor is where
-    /// the program left it: replaying everything the terminal saw lands the
-    /// cursor exactly where replaying the program's own bytes does.
+    /// the program left it. The tests around this one hold the paint's exact
+    /// bytes, a cursor move among them, and they held it once when it was
+    /// wrong — so this one asserts nothing it was told: it replays what the
+    /// terminal saw and what the program alone would have said, and the two
+    /// cursors have to agree.
     #[test]
     fn the_paint_leaves_the_cursor_where_the_program_put_it() {
         let mut out = fake(&["teh"]);

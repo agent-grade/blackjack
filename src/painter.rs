@@ -58,7 +58,7 @@ impl Painter {
     /// so a word broken across two rows is one word to the checker and two
     /// underlines on the screen.
     pub fn paint(&mut self, line: Option<&Line>, look: &Look) -> Option<Vec<u8>> {
-        if !self.on || look.mid_frame {
+        if !self.on {
             return None;
         }
         let Some(line) = line else {
@@ -66,15 +66,10 @@ impl Painter {
             // program that cleared it. What was cached describes a line that is
             // nowhere, and keeping it would also leave a pause running out for
             // a line nothing can paint.
-            self.forget();
+            self.line.clear();
+            self.flags = None;
             return None;
         };
-        // A glyph in the last column leaves the terminal holding a wrap it has
-        // not acted on, and moving the cursor away throws that away: the
-        // program's next character would land on this row rather than the next.
-        if look.wrap_pending {
-            return None;
-        }
         if self.checker.is_none() {
             self.checker = self.arriving.try_recv().ok();
         }
@@ -100,14 +95,23 @@ impl Painter {
             .flatten()
             .flat_map(|flag| runs_of(line, &flag.span))
             .collect();
-        (!runs.is_empty()).then(|| draw(&runs, look))
-    }
-
-    /// Nothing held about a line: no text to compare the next one against, no
-    /// flags to draw, and nothing for `wake_in` to wait out.
-    fn forget(&mut self) {
-        self.line.clear();
-        self.flags = None;
+        if runs.is_empty() {
+            return None;
+        }
+        // The two states nothing may be written in, and the reason they are
+        // tested here rather than on the way in: both are about the bytes, not
+        // the line. Refusing before the check would leave the line unchecked
+        // with its pause already run out, and then this painter asks to be
+        // woken again and again for work it will refuse again and again.
+        //
+        // A frame the program still has open would be presented half-drawn by
+        // this paint's own close; a glyph in the last column leaves the
+        // terminal holding a wrap that the cursor move would discard, and the
+        // program's next character would land on this row rather than the next.
+        if look.mid_frame || look.wrap_pending {
+            return None;
+        }
+        Some(draw(&runs, look))
     }
 
     /// How long the output side may wait on the wrapped program before this
@@ -174,13 +178,18 @@ fn runs_of(line: &Line, span: &Range<usize>) -> Vec<Run> {
 /// rather than by `ESC 7`/`ESC 8`: a terminal keeps one saved cursor per screen
 /// and the program uses that slot itself, so saving here would hand the program
 /// this paint's position back as its own. `ESC 7` would have carried the pen
-/// too, so this clears it before printing — the word comes out as the box drew
-/// it rather than in whatever the program last set — and puts back what the
-/// screen model holds afterwards, which is dim and nothing else. Against the
-/// program this wrapper is for that is a formality: neither capture has a
-/// single frame closing with any attribute set.
+/// too, so the one attribute this model tracks is turned off around the words
+/// and put back after them. Only that one: clearing the pen outright would
+/// print the words correctly and throw away every colour the model does not
+/// carry, and the program — believing its pen untouched — would go on writing
+/// in the wrong one. Against the program this wrapper is for it is a
+/// formality either way, since neither capture has a single frame closing with
+/// any attribute set at all.
 fn draw(runs: &[Run], look: &Look) -> Vec<u8> {
-    let mut paint = String::from("\x1b[?2026h\x1b[0m");
+    let mut paint = String::from("\x1b[?2026h");
+    if look.dimmed {
+        paint += "\x1b[22m";
+    }
     for run in runs {
         paint += &format!(
             "\x1b[{};{}H\x1b[4:3m\x1b[58:2::255:0:0m{}\x1b[59m\x1b[24m",
@@ -281,7 +290,7 @@ mod tests {
         let paint = paint_of(&mut checking(&["teh"]), &box_holding("a teh word"));
         assert_eq!(
             paint.expect("a paint"),
-            "\x1b[?2026h\x1b[0m\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[3;4H\x1b[?2026l"
+            "\x1b[?2026h\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[3;4H\x1b[?2026l"
         );
     }
 
@@ -312,6 +321,13 @@ mod tests {
         let mut redrawing = box_holding("a teh word");
         crate::parser::Parser::new().advance(&mut redrawing, b"\x1b[?2026h");
         assert!(ask(&mut painter, &redrawing).is_none());
+        // Refused because of the bytes, not the line: the line was checked all
+        // the same, or this painter would ask to be woken for a paint it is
+        // going to refuse again, and again, as fast as it is asked.
+        assert!(
+            painter.wake_in().is_none(),
+            "still waiting to check the line"
+        );
         assert!(
             ask(&mut painter, &closed).is_some(),
             "and never again once it closed"
@@ -440,27 +456,45 @@ mod tests {
     /// character would then land on this row instead of the next one.
     #[test]
     fn a_frame_ending_on_a_pending_wrap_is_left_alone() {
-        let mut screen = Screen::new(8, 3);
-        // The last thing drawn is the glyph itself: any cursor move after it
-        // is the terminal committing to the wrap, and then there is none left.
-        let drawn = "\x1b[?2026h\x1b[1;1H\u{2500}\u{2500}\u{2500}\x1b[3;1H\u{2500}\u{2500}\u{2500}\x1b[2;1H\u{276f}\u{a0}abcdef\x1b[?2026l";
-        crate::parser::Parser::new().advance(&mut screen, drawn.as_bytes());
+        // Drawn twice: the first frame ends on a cursor move, which is the
+        // terminal committing to the wrap, and it is the one that puts the line
+        // in the painter's hands. Only the second ends on the glyph itself.
+        let (mut painter, asked) = spanning(0..3);
+        let committed = wrapping_box("\x1b[2;7H");
+        assert!(!committed.look().wrap_pending, "the wrap was left pending");
         assert!(
-            screen.look().wrap_pending,
-            "the box did not fill its last column"
-        );
-        let (mut painter, _) = spanning(0..3);
-
-        assert!(
-            ask(&mut painter, &screen).is_none(),
+            ask(&mut painter, &committed).is_none(),
             "painted a changed line"
         );
-        assert!(ask(&mut painter, &screen).is_none());
+
+        let pending = wrapping_box("");
+        assert!(
+            pending.look().wrap_pending,
+            "the box did not fill its last column"
+        );
+        assert!(ask(&mut painter, &pending).is_none());
+        assert!(
+            painter.wake_in().is_none(),
+            "asking to be woken for a paint it will refuse again"
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "the line went unchecked");
     }
 
-    /// The paint prints the word itself, so it clears the pen first or the word
-    /// comes out in whatever the program last set — and puts back what the
-    /// program had, which this model knows as dim and nothing else.
+    /// A box whose last row runs to the last column, with whatever the program
+    /// did next before the frame closed.
+    fn wrapping_box(then: &str) -> Screen {
+        let mut screen = Screen::new(8, 3);
+        let drawn = format!(
+            "\x1b[?2026h\x1b[1;1H\u{2500}\u{2500}\u{2500}\x1b[3;1H\u{2500}\u{2500}\u{2500}\x1b[2;1H\u{276f}\u{a0}abcdef{then}\x1b[?2026l"
+        );
+        crate::parser::Parser::new().advance(&mut screen, drawn.as_bytes());
+        screen
+    }
+
+    /// The paint prints the word itself, so an attribute the program left set
+    /// would be printed with it. The one this model tracks is turned off around
+    /// the words and put back after them — and only that one, so the colours it
+    /// does not track are left exactly as the program set them.
     #[test]
     fn the_pen_the_program_left_is_put_back() {
         let mut screen = box_holding("a teh word");
@@ -473,8 +507,20 @@ mod tests {
         );
         let paint = String::from_utf8(ask(&mut painter, &screen).expect("a paint")).expect("utf8");
 
-        assert!(paint.starts_with("\x1b[?2026h\x1b[0m"), "{paint:?}");
+        assert!(paint.starts_with("\x1b[?2026h\x1b[22m"), "{paint:?}");
         assert!(paint.ends_with("\x1b[2m\x1b[?2026l"), "{paint:?}");
+    }
+
+    /// And with no attribute set, nothing is said about the pen at all: a reset
+    /// would print the words right and take every colour this model does not
+    /// track down with it.
+    #[test]
+    fn a_pen_the_program_left_alone_is_not_touched() {
+        let paint = paint_of(&mut checking(&["teh"]), &box_holding("a teh word")).expect("a paint");
+
+        assert!(!paint.contains("\x1b[0m"), "{paint:?}");
+        assert!(!paint.contains("\x1b[22m"), "{paint:?}");
+        assert!(!paint.contains("\x1b[2m"), "{paint:?}");
     }
 
     /// One flag can cover more than one row — a phrase the box wrapped — and is

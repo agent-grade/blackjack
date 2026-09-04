@@ -7,7 +7,8 @@ const SIZE: (u16, u16) = (40, 100);
 /// The whole paint, not its middle: the box puts `teh` at column 5 of row 2
 /// and leaves the cursor at column 13, so an underline in the wrong place or
 /// one that abandons the program's cursor is a different string.
-const UNDERLINE: &str = "\x1b[?2026h\x1b[0m\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;13H\x1b[?2026l";
+const UNDERLINE: &str =
+    "\x1b[?2026h\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;13H\x1b[?2026l";
 /// How long the box sits there untouched after being drawn once. The program
 /// draws nothing more, so nothing but the wrapper's own clock can produce the
 /// underline — and the real engine is still loading its dictionary when the
