@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 const SIZE: (u16, u16) = (24, 80);
 /// Typed in three goes, each waited for, so the log has to show the line being
@@ -78,6 +78,7 @@ fn a_piped_line_submits_the_way_a_typed_one_does() {
     let dump = std::fs::read_to_string(&log).unwrap_or_default();
     let submits: Vec<&str> = dump
         .lines()
+        .map(decision)
         .filter(|line| line.starts_with("submit \"") || line.starts_with("submit-dirty"))
         .collect();
     assert_eq!(
@@ -130,6 +131,14 @@ fn wrapped_shell(
     let child = pty.slave.spawn_command(wrapped).expect("spawn blackjack");
     drop(pty.slave);
     (pty.master, child)
+}
+
+/// A log line without the milliseconds it is stamped with, which is the
+/// decision on its own.
+fn decision(line: &str) -> &str {
+    line.trim_start()
+        .split_once(' ')
+        .map_or(line, |(_, decision)| decision)
 }
 
 fn log_path(name: &str) -> std::path::PathBuf {

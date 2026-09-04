@@ -7,7 +7,7 @@ use harper_core::linting::{LintGroup, Suggestion};
 use harper_core::spell::{FstDictionary, MergedDictionary, MutableDictionary};
 use harper_core::{Dialect, DictWordMetadata, Document};
 
-use crate::checker::{Checker, Edit, Flag};
+use crate::checker::{Checker, Class, Edit, Flag};
 
 /// The curated grammar classes and the harper rules each one turns on. Harper
 /// ships some seven hundred rules; everything outside this table stays off, so
@@ -62,9 +62,17 @@ impl Checker for HarperChecker {
             .organized_lints(&document)
             .into_iter()
             .filter(|(rule, _)| is_curated(rule))
-            .flat_map(|(_, lints)| {
-                lints.into_iter().map(|lint| Flag {
+            .flat_map(|(rule, lints)| {
+                // The engine already knows which of its rules spoke, so the
+                // class is read off the rule rather than guessed at from the
+                // words the span covers.
+                let class = match rule == SPELL_CHECK {
+                    true => Class::Spelling,
+                    false => Class::Grammar,
+                };
+                lints.into_iter().map(move |lint| Flag {
                     span: lint.span.start..lint.span.end,
+                    class,
                     message: lint.message,
                     suggestions: lint.suggestions.iter().map(edit_of).collect(),
                 })
@@ -99,8 +107,10 @@ fn edit_of(suggestion: &Suggestion) -> Edit {
 }
 
 /// The user's own words, one per line; blank lines and `#` comments are skipped
-/// so the file can be annotated. A word list that cannot be read costs one line
-/// on stderr — refusing to start over a missing word list would be worse than
+/// so the file can be annotated. A list that is not there yet is not a list the
+/// user got wrong — every session before the first learned word would otherwise
+/// open with a complaint. One that cannot be read for any other reason costs a
+/// line on stderr, since refusing to start over a word list would be worse than
 /// spell-checking without it.
 fn custom_words(path: &Path) -> MutableDictionary {
     let mut dictionary = MutableDictionary::new();
@@ -108,7 +118,9 @@ fn custom_words(path: &Path) -> MutableDictionary {
     let list = match std::fs::read_to_string(path) {
         Ok(list) => list,
         Err(error) => {
-            eprintln!("blackjack: {}: {error}", path.display());
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("blackjack: {}: {error}", path.display());
+            }
             return dictionary;
         }
     };
@@ -211,6 +223,15 @@ mod tests {
             "{:?}",
             flags[0].suggestions
         );
+    }
+
+    /// Which kind of slip a flag is comes from the rule that spoke, not from a
+    /// guess at the words it covers. The learn key is the reader: a word can be
+    /// taught to a dictionary and a grammar slip cannot.
+    #[test]
+    fn a_flag_carries_the_kind_of_slip_it_is() {
+        assert_eq!(checker().check("teh cat sat")[0].class, Class::Spelling);
+        assert_eq!(checker().check("This is an mule.")[0].class, Class::Grammar);
     }
 
     #[test]

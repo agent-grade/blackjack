@@ -15,11 +15,12 @@ use crate::checker::Checker;
 use crate::cli::Command;
 use crate::config::Config;
 use crate::input::{Input, SharedInput};
+use crate::log::Log;
 use crate::painter::Painter;
 use crate::picker::{Chord, Picker, SharedChecked, SharedLearned};
 use crate::resolve;
 use crate::screen::{Screen, SharedScreen};
-use crate::tap::{InputTap, Log, Tap};
+use crate::tap::{InputTap, Tap};
 
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 const BUF_LEN: usize = 8192;
@@ -64,8 +65,9 @@ pub fn run(command: &Command) -> Result<u32> {
     // is an Enter the wrapped program never received, so this writer is never
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
+    let log = Log::open();
     let painting = Painter::wanted();
-    let (pause, keys, arriving) = configured(painting);
+    let (pause, keys, arriving) = configured(painting, &log);
     let checked = SharedChecked::default();
     let learned = SharedLearned::default();
     let picker = Picker::new(
@@ -78,13 +80,13 @@ pub fn run(command: &Command) -> Result<u32> {
 
     let piped_stdin = !std::io::stdin().is_terminal();
     let input: SharedInput = Arc::new(Mutex::new(Input::new(piped_stdin)));
-    let log = Log::open();
 
     // Registered before raw mode is entered: a signal arriving in between would
     // otherwise hit the default disposition and leave the terminal raw.
-    watch_signals(Arc::clone(&master), Arc::clone(&screen)).context("watching for signals")?;
+    watch_signals(Arc::clone(&master), Arc::clone(&screen), log.clone())
+        .context("watching for signals")?;
     let _raw = RawMode::enable();
-    restore_terminal_on_panic();
+    restore_terminal_on_panic(log.clone());
 
     // Detached: this read blocks, and the child exiting must not wait on a keystroke.
     let typed = log.clone();
@@ -107,8 +109,15 @@ pub fn run(command: &Command) -> Result<u32> {
         std::io::stdout(),
         screen,
         input,
-        Painter::open(painting, pause, arriving, Arc::clone(&checked), learned),
-        log,
+        Painter::open(
+            painting,
+            pause,
+            arriving,
+            Arc::clone(&checked),
+            learned,
+            log.clone(),
+        ),
+        log.clone(),
     );
     // The read moves to its own thread so that this one can wait on a timer as
     // well as on the program: the underline is due a pause after the user
@@ -126,19 +135,27 @@ pub fn run(command: &Command) -> Result<u32> {
             }
         }
     });
-    if let Ended::TerminalGone = forward(arriving_output, &mut tap) {
+    let ended = forward(arriving_output, &mut tap);
+    log.line(format_args!("end: {ended}"));
+    if let Ended::TerminalGone = ended {
         // Nothing can be shown to anyone any more, so the wrapped program has
         // nobody left to talk to. Waiting on it instead would wait forever:
         // it fills the pty nothing is draining and blocks there.
         let _ = child.kill();
     }
-    tap.log_final_grid();
-
     let status = child.wait().context("waiting for the wrapped command");
     // The wrapped program's terminal dies with this handle, so it is held until
     // the session is genuinely over rather than left to the signal thread.
     drop(master);
-    Ok(exit_code(&status?))
+    let code = status.map(|status| exit_code(&status));
+    match &code {
+        Ok(code) => log.line(format_args!("exit {code}")),
+        Err(error) => log.line(format_args!("exit: {error:#}")),
+    }
+    // Last, and last for a reason: the grid is many lines of raw screen, so
+    // anything logged after it would read as another row of it.
+    tap.log_final_grid();
+    code
 }
 
 /// portable-pty reports a signal death as code 1 plus a signal *name*, so
@@ -167,12 +184,13 @@ fn signal_name(signal: i32) -> Option<String> {
 /// A resize the wrapped program never hears about leaves it drawing to the old
 /// geometry, and a signal death skips every destructor — including the one that
 /// takes the terminal back out of raw mode, which otherwise outlives us.
-fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
+fn watch_signals(master: Master, screen: SharedScreen, log: Log) -> Result<()> {
     let mut signals = Signals::new([SIGWINCH, SIGHUP, SIGINT, SIGTERM])?;
     std::thread::spawn(move || {
         for signal in signals.forever() {
             if signal == SIGWINCH {
                 let size = inherited_size();
+                log.line(format_args!("resize to {}x{}", size.cols, size.rows));
                 // Before the child hears about it: the master resize is what
                 // triggers its repaint, and a repaint parsed against the old
                 // geometry wraps in the wrong places for good.
@@ -183,6 +201,10 @@ fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
                     let _ = master.resize(size);
                 }
             } else {
+                log.line(format_args!(
+                    "end: signal {}",
+                    signal_name(signal).unwrap_or_else(|| signal.to_string())
+                ));
                 restore_terminal();
                 std::process::exit(128 + signal);
             }
@@ -198,7 +220,7 @@ fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
 /// Switched off, none of it happens — no config is read, no dictionary is
 /// built, and the channel it would have arrived on is closed from the start;
 /// the chord is the default one, which nothing will ask for.
-fn configured(wanted: bool) -> (Duration, Keys, Receiver<Box<dyn Checker + Send>>) {
+fn configured(wanted: bool, log: &Log) -> (Duration, Keys, Receiver<Box<dyn Checker + Send>>) {
     let (xdg, home) = (
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
@@ -206,14 +228,29 @@ fn configured(wanted: bool) -> (Duration, Keys, Receiver<Box<dyn Checker + Send>
     if !wanted {
         let quiet = Config::default();
         let keys = Keys::of(&quiet, xdg, home);
+        log.line(format_args!("start: painting off"));
         return (Duration::ZERO, keys, std::sync::mpsc::channel().1);
     }
     let config = Config::load();
     let keys = Keys::of(&config, xdg, home);
     let (pause, words) = (config.pause(), keys.words.clone());
+    log.line(format_args!(
+        "start: config {} pause {}ms grammar {:?} words {} fix {} learn {}",
+        Config::path().map_or("(nowhere)".into(), |path| path.display().to_string()),
+        pause.as_millis(),
+        config.grammar,
+        words
+            .as_ref()
+            .map_or("(nowhere)".into(), |path| path.display().to_string()),
+        keys.fix,
+        keys.learn,
+    ));
     let (built, arriving) = std::sync::mpsc::channel();
+    let building = log.clone();
     std::thread::spawn(move || {
-        let _ = built.send(config.checker(words.as_deref()));
+        let checker = config.checker(words.as_deref());
+        building.line(format_args!("checker ready"));
+        let _ = built.send(checker);
     });
     (pause, keys, arriving)
 }
@@ -246,6 +283,15 @@ enum Ended {
     ProgramDone,
     /// The terminal being written to is gone.
     TerminalGone,
+}
+
+impl std::fmt::Display for Ended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProgramDone => write!(f, "the program's output ran out"),
+            Self::TerminalGone => write!(f, "the terminal is gone"),
+        }
+    }
 }
 
 /// The wrapped program's output on one side and the painter's own clock on the
@@ -317,10 +363,13 @@ fn pty_size(reported: Option<(u16, u16)>) -> PtySize {
 /// twice. Deliberately for any thread's panic, not only the one that ends the
 /// session: a panic anywhere in here means the wrapper is no longer keeping
 /// its side of the bargain, and a cooked terminal is the safe way to be wrong.
-fn restore_terminal_on_panic() {
+/// Under a full-screen program a panic message on stderr is gone with the next
+/// redraw, so the log is the only place it can still be read afterwards.
+fn restore_terminal_on_panic(log: Log) {
     let printing = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panicking| {
         restore_terminal();
+        log.line(format_args!("end: panic: {panicking}"));
         printing(panicking);
     }));
 }
@@ -404,7 +453,7 @@ mod tests {
             Arc::new(Mutex::new(Screen::new(20, 3))),
             Arc::new(Mutex::new(Input::new(false))),
             Painter::off(),
-            crate::tap::Log::open(),
+            Log::open(),
         );
 
         assert_eq!(forward(arriving, &mut tap), Ended::TerminalGone);
@@ -414,9 +463,26 @@ mod tests {
         );
     }
 
+    /// What the session was configured with, and the moment the checker it
+    /// waited for arrived — the two lines a user asking "why was nothing
+    /// underlined at first" is answered by.
+    #[test]
+    fn the_start_and_the_checkers_arrival_are_accounted_for() {
+        let path = std::env::temp_dir().join(format!("blackjack-start-{}", std::process::id()));
+        let log = Log::writing(&path);
+
+        let (_, _, arriving) = configured(true, &log);
+        arriving.recv().expect("the checker");
+
+        let logged = std::fs::read_to_string(&path).expect("the log back");
+        let _ = std::fs::remove_file(&path);
+        assert!(logged.contains("start: config "), "{logged}");
+        assert!(logged.contains("checker ready"), "{logged}");
+    }
+
     #[test]
     fn the_switch_builds_no_checker_at_all() {
-        let (pause, _, arriving) = configured(false);
+        let (pause, _, arriving) = configured(false, &Log::off());
 
         assert_eq!(pause, Duration::ZERO);
         assert!(matches!(

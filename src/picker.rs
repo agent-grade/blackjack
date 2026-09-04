@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::checker::{Edit, Flag};
+use crate::checker::{Class, Edit, Flag};
 use crate::input::{ALT, CTRL, SHIFT};
 
 /// The key that fixes the word under the cursor, as the user writes it in the
@@ -19,6 +19,19 @@ use crate::input::{ALT, CTRL, SHIFT};
 pub struct Chord {
     modifiers: u16,
     character: char,
+}
+
+/// Written back the way the config writes it, so the log can say which key is
+/// actually live rather than which one the file asked for.
+impl std::fmt::Display for Chord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (bit, name) in [(SHIFT, "shift"), (ALT, "alt"), (CTRL, "ctrl")] {
+            if self.modifiers & bit != 0 {
+                write!(f, "{name}+")?;
+            }
+        }
+        write!(f, "{}", self.character)
+    }
 }
 
 impl Chord {
@@ -135,26 +148,38 @@ impl Picker {
     /// for this session and written down for the next; the underline goes at
     /// the next paint, since what is flagged is filtered through what has been
     /// learned rather than asked about again.
-    pub fn learn(&mut self, line: &str, cursor: usize) -> Option<()> {
-        let word = {
-            let checked = self.checked.lock().ok()?;
-            if checked.line != line {
-                return None;
-            }
-            let flag = checked.flags.iter().find(|flag| covers(flag, cursor))?;
-            let characters: Vec<char> = line.chars().collect();
-            if flag.span.end > characters.len() {
-                return None;
-            }
-            characters[flag.span.clone()].iter().collect::<String>()
-        };
-        if word.is_empty() || !self.learned.lock().ok()?.insert(word.clone()) {
-            // Already known: the keystroke has nothing to do, so it belongs to
-            // the wrapped program after all.
+    pub fn learn(&mut self, line: &str, cursor: usize) -> Option<String> {
+        let (flag, word) = self.claimed(line, cursor)?;
+        // A grammar slip is not a word, so there is nothing here to teach a
+        // dictionary and the keystroke belongs to the wrapped program.
+        if flag.class != Class::Spelling || word.is_empty() {
             return None;
         }
+        self.learned.lock().ok()?.insert(word.clone());
         self.write_down(&word);
-        Some(())
+        Some(word)
+    }
+
+    /// The flag under the cursor and the word it stands over — the question
+    /// both keys start from, so they cannot disagree about what is flagged.
+    /// A word already learned is not offered to either: its underline is gone,
+    /// and a key that acts on something the screen no longer shows is a
+    /// surprise.
+    fn claimed(&self, line: &str, cursor: usize) -> Option<(Flag, String)> {
+        let checked = self.checked.lock().ok()?;
+        if checked.line != line {
+            return None;
+        }
+        let characters: Vec<char> = line.chars().collect();
+        let learned = self.learned.lock().ok()?;
+        checked
+            .flags
+            .iter()
+            .filter(|flag| covers(flag, cursor))
+            .find_map(|flag| {
+                let word: String = characters.get(flag.span.clone())?.iter().collect();
+                (!learned.contains(&word)).then(|| (flag.clone(), word))
+            })
     }
 
     /// One word per line, appended. A list that cannot be written is a list the
@@ -209,12 +234,8 @@ impl Picker {
     }
 
     fn start(&mut self, line: &str, cursor: usize) -> Option<Cycling> {
-        let checked = self.checked.lock().ok()?;
-        if checked.line != line {
-            return None;
-        }
-        let flag = checked.flags.iter().find(|flag| covers(flag, cursor))?;
-        cycling_over(line, flag)
+        let (flag, _) = self.claimed(line, cursor)?;
+        cycling_over(line, &flag)
     }
 
     /// The keystrokes that take out what is standing and put the next offer in
@@ -302,30 +323,34 @@ mod tests {
     use super::*;
 
     fn flag(span: std::ops::Range<usize>, suggestions: &[Edit]) -> Flag {
+        classed(span, Class::Spelling, suggestions)
+    }
+
+    fn classed(span: std::ops::Range<usize>, class: Class, suggestions: &[Edit]) -> Flag {
         Flag {
             span,
+            class,
             message: String::new(),
             suggestions: suggestions.to_vec(),
         }
     }
 
     fn picking(line: &str, flags: Vec<Flag>) -> Picker {
-        learning(line, flags).0
+        learning("picking", line, flags).0
     }
 
     /// A picker with both keys, and the list a learned word is written to.
-    fn learning(line: &str, flags: Vec<Flag>) -> (Picker, SharedLearned, PathBuf) {
+    /// A word list written where the test can reach it, named after the test so
+    /// two running at once cannot collide.
+    fn learning(name: &str, line: &str, flags: Vec<Flag>) -> (Picker, SharedLearned, PathBuf) {
         let checked = SharedChecked::default();
         *checked.lock().expect("checked") = Checked {
             line: line.to_string(),
             flags,
         };
         let learned = SharedLearned::default();
-        let words = std::env::temp_dir().join(format!(
-            "blackjack-words-{}-{:p}.txt",
-            std::process::id(),
-            &checked
-        ));
+        let words =
+            std::env::temp_dir().join(format!("blackjack-{name}-{}.txt", std::process::id()));
         let picker = Picker::new(
             Chord::parse("ctrl+.").expect("a chord"),
             Chord::parse("ctrl+,").expect("a chord"),
@@ -511,11 +536,12 @@ mod tests {
     #[test]
     fn a_learned_word_is_written_down_once() {
         let (mut picker, learned, words) = learning(
+            "written-down",
             "a parkin",
             vec![flag(2..8, &[Edit::Replace("parking".into())])],
         );
 
-        assert_eq!(picker.learn("a parkin", 8), Some(()));
+        assert_eq!(picker.learn("a parkin", 8), Some("parkin".to_string()));
 
         assert_eq!(
             std::fs::read_to_string(&words).expect("the list"),
@@ -530,6 +556,7 @@ mod tests {
     #[test]
     fn learning_a_word_twice_is_a_keystroke_the_program_gets() {
         let (mut picker, _, words) = learning(
+            "learned-twice",
             "a parkin",
             vec![flag(2..8, &[Edit::Replace("parking".into())])],
         );
@@ -544,11 +571,49 @@ mod tests {
         std::fs::remove_file(&words).ok();
     }
 
+    /// A grammar slip is not a word, so there is nothing under the cursor to
+    /// teach a dictionary: the key is the user's and the program gets it.
+    #[test]
+    fn a_grammar_flag_is_not_something_to_learn() {
+        let (mut picker, learned, words) = learning(
+            "grammar",
+            "a apple",
+            vec![classed(0..1, Class::Grammar, &[Edit::Replace("an".into())])],
+        );
+
+        assert_eq!(picker.learn("a apple", 1), None);
+
+        assert!(learned.lock().expect("learned").is_empty());
+        assert!(!words.exists(), "a grammar slip reached the word list");
+    }
+
+    /// The two keys agree about what is flagged. A word the user has kept is no
+    /// longer underlined, so the fix key does not rewrite it either — a key
+    /// acting on something the screen stopped showing is a surprise.
+    #[test]
+    fn the_fix_key_leaves_a_learned_word_alone() {
+        let (mut picker, learned, _) = learning(
+            "fix-learned",
+            "a parkin",
+            vec![flag(2..8, &[Edit::Replace("parking".into())])],
+        );
+        assert!(picker.fix("a parkin", 8).is_some(), "no fix to begin with");
+        picker.interrupted();
+
+        learned
+            .lock()
+            .expect("learned")
+            .insert("parkin".to_string());
+
+        assert_eq!(picker.fix("a parkin", 8), None);
+    }
+
     /// The same rule as the fix key: it answers for the word under the cursor
     /// and for nothing else.
     #[test]
     fn learning_needs_a_flag_under_the_cursor_too() {
         let (mut picker, learned, _) = learning(
+            "no-flag",
             "a parkin word",
             vec![flag(2..8, &[Edit::Replace("parking".into())])],
         );

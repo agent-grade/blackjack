@@ -1,45 +1,12 @@
-use std::fmt::Arguments;
-use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::input::{Event, SharedInput};
+use crate::log::{Log, escape};
 use crate::painter::Painter;
 use crate::parser::Parser;
 use crate::picker::Picker;
 use crate::screen::{Line, Look, SharedScreen};
-
-const LOG_VAR: &str = "BLACKJACK_DEBUG_LOG";
-
-/// One handle behind one lock, because the two taps run on different threads:
-/// independent appenders interleave inside a line, and the grid dump is far too
-/// long to rely on a write landing whole.
-#[derive(Clone)]
-pub struct Log(Option<Arc<Mutex<File>>>);
-
-impl Log {
-    pub fn open() -> Self {
-        Self(
-            std::env::var_os(LOG_VAR)
-                .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
-                .map(|file| Arc::new(Mutex::new(file))),
-        )
-    }
-
-    fn is_on(&self) -> bool {
-        self.0.is_some()
-    }
-
-    fn line(&self, line: Arguments) {
-        let Some(file) = &self.0 else {
-            return;
-        };
-        if let Ok(mut file) = file.lock() {
-            let _ = writeln!(file, "{line}");
-        }
-    }
-}
 
 /// The wrapped program's output on its way to the terminal, with a copy fed to
 /// the screen model. The terminal is written first and nothing is held back or
@@ -88,15 +55,29 @@ impl<W: Write> Tap<W> {
     /// corrected or not, that is the line the user typed.
     fn resync(&mut self, frame_line: Option<&Line>) -> Option<Line> {
         let Ok(mut input) = self.input.lock() else {
+            self.log
+                .line(format_args!("no resync: the input model is unreadable"));
             return frame_line.cloned();
         };
         // Taken on every frame, box or none, or a keystroke from an older frame
         // eats the first correction the box comes back for.
         let raced = input.raced_the_frame();
-        let typed = input.rejoin(frame_line?);
-        if (input.stale() || !raced) && input.resync(&typed) {
+        let frame_line = frame_line?;
+        let typed = input.rejoin(frame_line);
+        if self.log.is_on() && typed.text != frame_line.text {
             self.log.line(format_args!(
-                "resync \"{}\" @{}",
+                "rejoin \"{}\" from the rows the box wrapped it onto",
+                escape(typed.text.as_bytes())
+            ));
+        }
+        let stale = input.stale();
+        if (stale || !raced) && input.resync(&typed) {
+            self.log.line(format_args!(
+                "resync ({}) \"{}\" @{}",
+                match stale {
+                    true => "the model had gone stale",
+                    false => "no keystroke raced the frame",
+                },
                 escape(input.line().as_bytes()),
                 input.cursor()
             ));
@@ -125,7 +106,11 @@ impl<W: Write> Tap<W> {
     fn rejoined(&self, line: &Line) -> Line {
         match self.input.lock() {
             Ok(input) => input.rejoin(line),
-            Err(_) => line.clone(),
+            Err(_) => {
+                self.log
+                    .line(format_args!("no rejoin: the input model is unreadable"));
+                line.clone()
+            }
         }
     }
 
@@ -139,7 +124,6 @@ impl<W: Write> Tap<W> {
         // landed.
         let _ = self.out.write_all(&paint);
         let _ = self.out.flush();
-        self.log.line(format_args!("paint {}B", paint.len()));
     }
 
     /// How long this tap may wait on the wrapped program before it has
@@ -234,12 +218,32 @@ impl<W: Write> InputTap<W> {
             let input = self.input.lock().ok()?;
             (input.line().to_string(), input.cursor())
         };
-        match fixing {
-            true => self.picker.fix(&line, cursor),
-            // Nothing is typed for a word learned: the keystroke is answered by
-            // the underline going, which the next paint does on its own.
-            false => self.picker.learn(&line, cursor).map(|()| Vec::new()),
+        if fixing {
+            let fix = self.picker.fix(&line, cursor);
+            if self.log.is_on() {
+                self.log.line(format_args!(
+                    "fix: {}",
+                    match &fix {
+                        Some(keys) => format!("\"{}\"", escape(keys)),
+                        None => "nothing under the cursor to fix".to_string(),
+                    }
+                ));
+            }
+            return fix;
         }
+        // Nothing is typed for a word learned: the keystroke is answered by the
+        // underline going, which the next paint does on its own.
+        let learned = self.picker.learn(&line, cursor);
+        if self.log.is_on() {
+            self.log.line(format_args!(
+                "learn: {}",
+                match &learned {
+                    Some(word) => format!("\"{word}\""),
+                    None => "nothing under the cursor to learn".to_string(),
+                }
+            ));
+        }
+        learned.map(|_| Vec::new())
     }
 }
 
@@ -254,11 +258,6 @@ impl<W: Write> Write for InputTap<W> {
                 // anyone asking the screen.
                 input.feed(&fix);
                 input.take_events();
-            }
-            // Escaping allocates, and this runs per keystroke.
-            if self.log.is_on() {
-                self.log
-                    .line(format_args!("fix {}B \"{}\"", fix.len(), escape(&fix)));
             }
             // The chord itself never reached the program, and the caller is
             // told its keystroke was taken.
@@ -300,24 +299,12 @@ impl<W: Write> Write for InputTap<W> {
     }
 }
 
-/// Bytes as a log line can carry them: an escape byte has to survive legibly
-/// while typed text stays readable.
-fn escape(bytes: &[u8]) -> String {
-    let mut out = Vec::with_capacity(bytes.len());
-    for &byte in bytes {
-        match byte {
-            b'"' | b'\\' => out.extend_from_slice(&[b'\\', byte]),
-            0x20..=0x7e | 0x80.. => out.push(byte),
-            _ => out.extend_from_slice(format!("\\x{byte:02x}").as_bytes()),
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::checker::{Checker, Edit};
+    use crate::checker::{Checker, Edit, FakeChecker};
     use crate::picker::SharedChecked;
     use crate::screen::Screen;
 
@@ -342,7 +329,7 @@ mod tests {
         (
             input.clone(),
             checked,
-            InputTap::new(Vec::new(), input, picker, Log(None)),
+            InputTap::new(Vec::new(), input, picker, Log::off()),
         )
     }
 
@@ -362,6 +349,7 @@ mod tests {
     ) -> Vec<crate::checker::Flag> {
         vec![crate::checker::Flag {
             span,
+            class: crate::checker::Class::Spelling,
             message: String::new(),
             suggestions: fixes.to_vec(),
         }]
@@ -432,7 +420,7 @@ mod tests {
             screen,
             input.clone(),
             Painter::checking(checker),
-            Log(None),
+            Log::off(),
         )
     }
 
@@ -452,7 +440,7 @@ mod tests {
     }
 
     fn typed(input: &SharedInput, keys: &[u8]) {
-        InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None))
+        InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off())
             .write_all(keys)
             .expect("type");
     }
@@ -478,7 +466,7 @@ mod tests {
             screen,
             input,
             Painter::checking(checker),
-            Log(None),
+            Log::off(),
         );
 
         // One frame per write, which is what the tap sees from a pty: handing
@@ -683,7 +671,13 @@ mod tests {
         // it, which is the whole point of reading the box across its rows.
         let (input, checked, mut keys) = picking("", Vec::new());
         let screen = Arc::new(Mutex::new(Screen::new(20, 4)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
 
         out.write_all(wrapped(above, below, (2, 10)).as_bytes())
             .expect("draw");
@@ -735,10 +729,16 @@ mod tests {
     #[test]
     fn a_wrapped_row_is_rejoined_with_the_space_the_box_did_not_draw() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"\x1b[A").expect("recall");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(wrap_frames(0, 6)).expect("draw");
         assert_eq!(input.lock().expect("input").line(), TYPED);
     }
@@ -749,12 +749,18 @@ mod tests {
     #[test]
     fn a_break_the_user_typed_survives_the_frame_that_redraws_it() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(TYPED.as_bytes()).expect("type");
         keys.write_all(b"\x1b[13;2u").expect("shift+enter");
         keys.write_all(b"after\x1b[D").expect("type on");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(wrap_frames(0, 7)).expect("draw");
         out.write_all(wrap_frames(7, 8)).expect("redraw");
         let input = input.lock().expect("input");
@@ -769,10 +775,16 @@ mod tests {
     #[test]
     fn a_read_ending_mid_redraw_is_answered_by_the_last_whole_frame() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"\x1b[A").expect("recall");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         let redrawing = [wrap_frames(0, 6), &wrap_frames(6, 7)[..80]].concat();
         out.write_all(&redrawing).expect("draw");
         let input = input.lock().expect("input");
@@ -786,10 +798,16 @@ mod tests {
     #[test]
     fn a_frame_without_a_box_still_answers_the_keystrokes_before_it() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"hi").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(b"\x1b[?2026h\x1b[2Jbusy\x1b[?2026l")
             .expect("no box");
         let redrawn = format!("\x1b[2J{}", boxed("other", 5));
@@ -803,12 +821,6 @@ mod tests {
     #[test]
     fn only_a_frame_that_corrects_the_line_is_logged() {
         let path = std::env::temp_dir().join(format!("blackjack-resync-{}", std::process::id()));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)
-            .expect("a log to write");
         let input = shared_input();
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
         let mut out = Tap::new(
@@ -816,7 +828,7 @@ mod tests {
             screen,
             input,
             Painter::off(),
-            Log(Some(Arc::new(Mutex::new(file)))),
+            Log::writing(&path),
         );
         out.write_all(boxed("hi", 2).as_bytes()).expect("draw");
         out.write_all(boxed("hi", 2).as_bytes()).expect("redraw");
@@ -825,6 +837,64 @@ mod tests {
         let logged = std::fs::read_to_string(&path).expect("the log back");
         let _ = std::fs::remove_file(&path);
         assert_eq!(logged.matches("resync").count(), 2);
+    }
+
+    /// One assertion per kind of decision. The log is the account a user sends
+    /// when a paint went wrong, and an account missing a kind cannot be read:
+    /// the frame that changed the line, the check that followed it, the paint
+    /// that followed that, and each chord answering for itself. That the log
+    /// reaches the file at all from a real session is `tests/paint.rs`.
+    #[test]
+    fn the_log_accounts_for_each_kind_of_decision() {
+        let path = std::env::temp_dir().join(format!("blackjack-decisions-{}", std::process::id()));
+        let log = Log::writing(&path);
+        // Nothing typed: the model is filled by the frame, which is the
+        // correction the resync line records.
+        let input = shared_input();
+        let checked = SharedChecked::default();
+        publish(
+            &checked,
+            "a teh",
+            flagging(2..5, &[Edit::Replace("the".into())]),
+        );
+        let picker = Picker::new(
+            crate::picker::Chord::parse("ctrl+.").expect("a chord"),
+            crate::picker::Chord::parse("ctrl+,").expect("a chord"),
+            checked,
+            crate::picker::SharedLearned::default(),
+            None,
+        );
+        let mut keys = InputTap::new(Vec::new(), input.clone(), picker, log.clone());
+        let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
+        let painter =
+            Painter::checking(Box::new(FakeChecker::spelling(&["teh"]))).logging(log.clone());
+        let mut out = Tap::new(Vec::new(), screen, input, painter, log);
+
+        out.write_all(boxed("a teh", 5).as_bytes()).expect("draw");
+        out.write_all(boxed("a teh", 5).as_bytes()).expect("redraw");
+        keys.write_all(b"\x1b[46;5u").expect("the fix key");
+        keys.write_all(b"\x1b[44;5u").expect("the learn key");
+
+        let logged = std::fs::read_to_string(&path).expect("the log back");
+        let _ = std::fs::remove_file(&path);
+        for kind in [
+            "out ",
+            "resync (",
+            "no paint: line changed",
+            "check \"a teh\"",
+            "paint ",
+            "fix: ",
+            "learn: ",
+        ] {
+            assert!(logged.contains(kind), "no {kind:?} line in {logged}");
+        }
+        assert!(
+            logged.lines().all(|line| line
+                .split_whitespace()
+                .next()
+                .is_some_and(|stamp| stamp.parse::<u64>().is_ok())),
+            "every line is stamped: {logged}"
+        );
     }
 
     /// The underline is written to the terminal after the program's own frame,
@@ -840,7 +910,7 @@ mod tests {
             screen.clone(),
             input,
             Painter::checking(checker),
-            Log(None),
+            Log::off(),
         );
         // The first frame is the one that changed the line; the paint is on the
         // frame after, once there is a line that has held still.
@@ -988,10 +1058,16 @@ mod tests {
     #[test]
     fn a_frame_corrects_a_line_the_input_model_could_only_record() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"hi\x1b[A").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(boxed("recalled", 8).as_bytes())
             .expect("draw");
         let input = input.lock().expect("input");
@@ -1005,10 +1081,16 @@ mod tests {
     #[test]
     fn a_frame_that_agrees_leaves_the_line_alone() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"hi\x1b[D").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(boxed("hi", 1).as_bytes()).expect("draw");
         out.write_all(boxed("hi", 1).as_bytes()).expect("redraw");
         let input = input.lock().expect("input");
@@ -1022,10 +1104,16 @@ mod tests {
     #[test]
     fn a_frame_older_than_the_keystrokes_does_not_take_the_line_back() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"ab").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(boxed("a", 1).as_bytes()).expect("draw");
         let input = input.lock().expect("input");
         assert_eq!(input.line(), "ab");
@@ -1038,10 +1126,16 @@ mod tests {
     #[test]
     fn a_key_that_could_not_be_applied_is_answered_by_an_agreeing_frame_too() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         keys.write_all(b"hi\x1b[D\x1b[A").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
-        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input.clone(),
+            Painter::off(),
+            Log::off(),
+        );
         out.write_all(boxed("hi", 2).as_bytes()).expect("draw");
         assert_eq!(input.lock().expect("input").cursor(), 2);
     }
@@ -1050,7 +1144,13 @@ mod tests {
     fn the_output_tap_tracks_a_character_split_across_two_reads() {
         let screen = Arc::new(Mutex::new(Screen::new(10, 1)));
         let input = shared_input();
-        let mut tap = Tap::new(Vec::new(), screen.clone(), input, Painter::off(), Log(None));
+        let mut tap = Tap::new(
+            Vec::new(),
+            screen.clone(),
+            input,
+            Painter::off(),
+            Log::off(),
+        );
         for read in split_reads() {
             tap.write_all(read).expect("write");
         }
@@ -1060,7 +1160,7 @@ mod tests {
     #[test]
     fn the_input_tap_tracks_a_character_split_across_two_reads() {
         let input = shared_input();
-        let mut tap = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
+        let mut tap = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log::off());
         for read in split_reads() {
             tap.write_all(read).expect("write");
         }

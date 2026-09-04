@@ -52,6 +52,43 @@ fn tells_a_missing_program_from_one_it_may_not_run() {
     assert!(stderr.contains("is a directory"), "stderr was {stderr:?}");
 }
 
+/// The questions a user asks the wrapper about itself, answered before
+/// anything is wrapped. An argv the program cannot act on exits 2, told apart
+/// from a wrapped program that ran and failed, since a caller reads the two
+/// differently.
+#[test]
+fn answers_for_itself_without_wrapping_anything() {
+    let (code, out, _) = blackjack(&["--help"]);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("usage: blackjack"), "{out:?}");
+
+    let (code, out, _) = blackjack(&["--version"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        out.trim(),
+        format!("blackjack {}", env!("CARGO_PKG_VERSION"))
+    );
+
+    for wrong in [["--paint"], ["claude"], ["--check"]] {
+        let (code, _, error) = blackjack(&wrong);
+        assert_eq!(code, Some(2), "for {wrong:?}");
+        assert!(error.contains("usage: blackjack"), "{error:?}");
+    }
+}
+
+fn blackjack(args: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_blackjack"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run blackjack");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 fn run_program(program: &str) -> (Option<i32>, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_blackjack"))
         .args(["--", program])

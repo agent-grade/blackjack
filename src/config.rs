@@ -54,12 +54,29 @@ impl Config {
     /// malformed never stops the overlay: the wrapped program is what the user
     /// came for, and spell-check is the part that can be skipped.
     pub fn load() -> Self {
-        match config_path(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            std::env::var_os("HOME"),
-        ) {
+        match Self::path() {
             Some(path) => Self::read(&path, std::env::var_os("HOME")),
             None => Self::default(),
+        }
+    }
+
+    /// The file the wrapper reads, whether or not anything is there. A user
+    /// asking why a setting did not take is asking which file was read.
+    pub fn path() -> Option<PathBuf> {
+        config_path(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+    }
+
+    /// The config with a file the user got wrong reported rather than shrugged
+    /// at. `load` is the wrapper's way, because a session is worth more than a
+    /// setting; this is the way of the commands whose whole job is to explain a
+    /// config, where a shrug would be the wrong answer to the question asked.
+    pub fn strict() -> anyhow::Result<Self> {
+        match Self::path() {
+            Some(path) => Self::parse(&path, std::env::var_os("HOME")),
+            None => Ok(Self::default()),
         }
     }
 
@@ -103,25 +120,32 @@ impl Config {
     }
 
     fn read(path: &Path, home: Option<OsString>) -> Self {
+        Self::parse(path, home).unwrap_or_else(|error| {
+            eprintln!("blackjack: {error}");
+            Self::default()
+        })
+    }
+
+    /// One reading of the file, for both policies above. A file that is not
+    /// there is not a file the user got wrong.
+    fn parse(path: &Path, home: Option<OsString>) -> anyhow::Result<Self> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
-            Err(error) => {
-                if error.kind() != ErrorKind::NotFound {
-                    eprintln!("blackjack: {}: {error}", path.display());
-                }
-                return Self::default();
-            }
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => anyhow::bail!("{}: {error}", path.display()),
         };
 
-        match toml::from_str::<Self>(&text) {
-            Ok(config) => config.with_home(home),
-            Err(error) => {
+        toml::from_str::<Self>(&text)
+            .map(|config| config.with_home(home))
+            .map_err(|error| {
                 let reason = error.to_string();
-                let reason = reason.lines().next().unwrap_or("cannot be read");
-                eprintln!("blackjack: {}: {reason}", path.display());
-                Self::default()
-            }
-        }
+                let reason = reason
+                    .lines()
+                    .next()
+                    .unwrap_or("cannot be read")
+                    .to_string();
+                anyhow::anyhow!("{}: {reason}", path.display())
+            })
     }
 
     /// A config file is hand-written, so a leading `~/` in a path is what the

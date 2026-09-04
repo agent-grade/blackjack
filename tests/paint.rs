@@ -28,7 +28,7 @@ const FAKE_BOX: &str = "\\033[?2026h\\033[1;1H\\342\\224\\200\\342\\224\\200\\34
 /// another frame to paint on is waiting forever.
 #[test]
 fn a_misspelling_in_a_box_nobody_redraws_is_still_underlined() {
-    let seen = run_wrapped(false);
+    let (seen, _) = run_wrapped(false);
     assert_eq!(
         seen.matches(UNDERLINE).count(),
         1,
@@ -40,15 +40,44 @@ fn a_misspelling_in_a_box_nobody_redraws_is_still_underlined() {
     );
 }
 
+/// And the log says so, in the words a user reporting a mis-paint would read:
+/// this is the only place the painter's own log — the one `pty::run` hands it —
+/// is asked whether it reaches the file.
 #[test]
-fn the_kill_switch_leaves_the_terminal_alone() {
-    let seen = run_wrapped(true);
+fn the_kill_switch_leaves_the_terminal_alone_and_says_why() {
+    let (seen, logged) = run_wrapped(true);
+
     assert!(seen.contains("a teh word"), "the box never arrived");
     assert!(!seen.contains("\x1b[4:3m"), "painted anyway: {seen:?}");
+    assert!(logged.contains("no paint: off"), "{logged}");
 }
 
-/// Everything the terminal saw, with the wrapper reaped once its output ended.
-fn run_wrapped(paint_off: bool) -> String {
+/// The other half of the same account: a session that did paint says what it
+/// checked, what it left out of the check, and where the underline went.
+#[test]
+fn the_log_of_a_painting_session_says_what_it_did() {
+    let (_, logged) = run_wrapped(false);
+
+    assert!(logged.contains("start: config "), "{logged}");
+    assert!(logged.contains("check \"a teh word\""), "{logged}");
+    assert!(logged.contains("flags [2..5]"), "{logged}");
+    assert!(logged.contains("paint "), "{logged}");
+    assert!(
+        logged.contains(" at [1,4]"),
+        "the underline's own row and column: {logged}"
+    );
+    assert!(
+        logged.contains("no paint: "),
+        "a refusal with its reason: {logged}"
+    );
+}
+
+/// Everything the terminal saw and everything the wrapper wrote down about it,
+/// with the wrapper reaped once its output ended.
+fn run_wrapped(paint_off: bool) -> (String, String) {
+    let log =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("paint-{paint_off}.log"));
+    let _ = std::fs::remove_file(&log);
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: SIZE.0,
@@ -60,6 +89,7 @@ fn run_wrapped(paint_off: bool) -> String {
     let mut wrapped = CommandBuilder::new(env!("CARGO_BIN_EXE_blackjack"));
     let script = format!("printf '{FAKE_BOX}'; sleep {SILENCE}");
     wrapped.args(["--", "sh", "-c", &script]);
+    wrapped.env("BLACKJACK_DEBUG_LOG", &log);
     // Inherited otherwise, which would hand the wrapper the kill switch and
     // have the painting test pass by never painting.
     match paint_off {
@@ -84,5 +114,8 @@ fn run_wrapped(paint_off: bool) -> String {
     }
     drop(pty.slave);
     drop(pty.master);
-    String::from_utf8_lossy(&drained.join().expect("drain")).into_owned()
+    (
+        String::from_utf8_lossy(&drained.join().expect("drain")).into_owned(),
+        std::fs::read_to_string(&log).expect("the log back"),
+    )
 }

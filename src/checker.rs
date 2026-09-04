@@ -13,14 +13,29 @@ pub enum Edit {
     Remove,
 }
 
+/// What kind of slip a flag stands over. The learn key is the reader and the
+/// engine is the authority: a word can be taught to a dictionary, and a
+/// grammar slip is not a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    Spelling,
+    Grammar,
+}
+
 /// One stretch of the line worth underlining. `span` counts **characters**, not
 /// bytes: the painter works in columns, and a byte offset is already wrong by
 /// the time a single accented character precedes the word.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
     pub span: Range<usize>,
+    pub class: Class,
     pub message: String,
     pub suggestions: Vec<Edit>,
+}
+
+/// The word a flag stands over, as the line has it.
+pub fn worded(text: &str, span: &Range<usize>) -> String {
+    text.chars().take(span.end).skip(span.start).collect()
 }
 
 /// Everything the wrapper knows about a checking engine. Harper is the first
@@ -60,6 +75,7 @@ impl Checker for FakeChecker {
             .into_iter()
             .filter(|(_, word)| self.flagged.iter().any(|flagged| flagged == word))
             .map(|(span, word)| Flag {
+                class: Class::Spelling,
                 span,
                 message: format!("`{word}` is flagged"),
                 suggestions: self.fixes.clone(),

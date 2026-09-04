@@ -14,8 +14,30 @@ const NOT_A_WORD: [char; 7] = ['/', '\\', ':', '#', '@', '~', '_'];
 /// a span into what the user typed.
 pub fn blanked(line: &str) -> String {
     let mut prose = String::with_capacity(line.len());
+    for (token, code) in classified(line) {
+        match code {
+            true => prose.extend(token.chars().map(blank)),
+            false => prose.push_str(token),
+        }
+    }
+    prose
+}
+
+/// The tokens the filter took out — the answer to "why was that not checked",
+/// which is the question a filter this quiet will be asked.
+pub fn removed(line: &str) -> Vec<&str> {
+    classified(line)
+        .filter(|(token, code)| *code && !token.trim().is_empty())
+        .map(|(token, _)| token.trim_end())
+        .collect()
+}
+
+/// Each token of the line and whether it is code, decided once for both readers
+/// above — a filter that took a token out and a filter that says it did must
+/// not be able to disagree.
+fn classified(line: &str) -> impl Iterator<Item = (&str, bool)> {
     let mut quoted = false;
-    for token in line.split_inclusive(char::is_whitespace) {
+    line.split_inclusive(char::is_whitespace).map(move |token| {
         let word = token.trim_end();
         let ticks = word.matches('`').count();
         // Code the user marked as code. The run stays blanked until its closing
@@ -23,12 +45,8 @@ pub fn blanked(line: &str) -> String {
         // it looks like on the screen too.
         let inside = quoted;
         quoted ^= ticks % 2 == 1;
-        match inside || quoted || is_code(word) {
-            true => prose.extend(token.chars().map(blank)),
-            false => prose.push_str(token),
-        }
-    }
-    prose
+        (token, inside || quoted || is_code(word))
+    })
 }
 
 /// Whitespace is what tokens are counted by, so it is the one thing a blank
@@ -185,6 +203,14 @@ mod tests {
 
         assert!(!prose.contains("rest"), "{prose:?}");
         assert!(prose.starts_with("say "), "{prose:?}");
+    }
+
+    /// What was taken out, which is the answer to "why was that not checked".
+    #[test]
+    fn the_filter_can_say_what_it_took_out() {
+        let line = "open src/pty.rs and fix teh `bug` now";
+
+        assert_eq!(removed(line), ["src/pty.rs", "`bug`"]);
     }
 
     /// A misspelling standing next to a path is still a misspelling.

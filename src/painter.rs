@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::checker::{Checker, Flag};
+use crate::checker::{Checker, Flag, worded};
+use crate::log::Log;
 use crate::picker::{SharedChecked, SharedLearned};
 use crate::prose;
 use crate::screen::{Line, Look};
@@ -33,6 +34,9 @@ pub struct Painter {
     /// What the checker said, left where the keystroke side can read it: the
     /// picker runs there and the checking runs here.
     checked: SharedChecked,
+    /// Why this painter did what it did, for a user who watched it do something
+    /// else. Nothing here changes what is painted.
+    log: Log,
     /// And what the user has since said back. Read on every paint rather than
     /// on every check, so a word learned now stops being underlined at the next
     /// frame instead of the next time the line is asked about.
@@ -54,6 +58,7 @@ impl Painter {
         arriving: Receiver<Box<dyn Checker + Send>>,
         checked: SharedChecked,
         learned: SharedLearned,
+        log: Log,
     ) -> Self {
         Self {
             on,
@@ -64,6 +69,7 @@ impl Painter {
             changed: Instant::now(),
             flags: None,
             checked,
+            log,
             learned,
         }
     }
@@ -76,7 +82,7 @@ impl Painter {
     /// underlines on the screen.
     pub fn paint(&mut self, line: Option<&Line>, look: &Look) -> Option<Vec<u8>> {
         if !self.on {
-            return None;
+            return self.refused("off");
         }
         let Some(line) = line else {
             // The box has left the screen — an alternate screen, a dialog, a
@@ -85,7 +91,7 @@ impl Painter {
             // a line nothing can paint.
             self.line.clear();
             self.flags = None;
-            return None;
+            return self.refused("no box");
         };
         if self.checker.is_none() {
             self.checker = self.arriving.try_recv().ok();
@@ -94,30 +100,36 @@ impl Painter {
             self.line.clone_from(&line.text);
             self.changed = Instant::now();
             self.flags = None;
-            return None;
+            return self.refused("line changed");
         }
         if self.flags.is_none() {
             if self.changed.elapsed() < self.pause {
-                return None;
+                return self.refused("still typing");
             }
             // Asked about the prose only: a checker has nothing useful to say
             // about a path or a flag, and everything it says about one is noise
             // over something the user typed on purpose.
-            let flags = self.checker.as_mut()?.check(&prose::blanked(&line.text));
+            let Some(checker) = self.checker.as_mut() else {
+                return self.refused("no checker yet");
+            };
+            let flags = checker.check(&prose::blanked(&line.text));
+            self.checked(&line.text, &flags);
             self.publish(&line.text, &flags);
             self.flags = Some(flags);
         }
-        let learned = self.learned.lock().ok()?;
+        let Ok(learned) = self.learned.lock() else {
+            return self.refused("learned words unreadable");
+        };
         let runs: Vec<_> = self
             .flags
             .iter()
             .flatten()
-            .filter(|flag| !learned.contains(&worded(line, &flag.span)))
+            .filter(|flag| !learned.contains(&worded(&line.text, &flag.span)))
             .flat_map(|flag| runs_of(line, &flag.span))
             .collect();
         drop(learned);
         if runs.is_empty() {
-            return None;
+            return self.refused("nothing to underline");
         }
         // The two states nothing may be written in, and the reason they are
         // tested here rather than on the way in: both are about the bytes, not
@@ -129,10 +141,51 @@ impl Painter {
         // this paint's own close; a glyph in the last column leaves the
         // terminal holding a wrap that the cursor move would discard, and the
         // program's next character would land on this row rather than the next.
-        if look.mid_frame || look.wrap_pending {
-            return None;
+        if look.mid_frame {
+            return self.refused("mid frame");
         }
-        Some(draw(&runs, look))
+        if look.wrap_pending {
+            return self.refused("wrap pending");
+        }
+        let paint = draw(&runs, look);
+        if self.log.is_on() {
+            let places: Vec<String> = runs
+                .iter()
+                .map(|run| format!("{},{}", run.row, run.col))
+                .collect();
+            self.log.line(format_args!(
+                "paint {}B at [{}]",
+                paint.len(),
+                places.join(" ")
+            ));
+        }
+        Some(paint)
+    }
+
+    /// Nothing painted, and why. Every path out of `paint` that draws nothing
+    /// comes through here, so the log accounts for each frame it was offered.
+    fn refused(&self, reason: &str) -> Option<Vec<u8>> {
+        self.log.line(format_args!("no paint: {reason}"));
+        None
+    }
+
+    /// What was asked and what came back: the line as the user typed it, the
+    /// tokens the filter took out before the checker saw it, and where the
+    /// answers landed.
+    fn checked(&self, line: &str, flags: &[Flag]) {
+        if !self.log.is_on() {
+            return;
+        }
+        let spans: Vec<String> = flags
+            .iter()
+            .map(|flag| format!("{}..{}", flag.span.start, flag.span.end))
+            .collect();
+        self.log.line(format_args!(
+            "check \"{}\" not prose {:?} flags [{}]",
+            crate::log::escape(line.as_bytes()),
+            prose::removed(line),
+            spans.join(" ")
+        ));
     }
 
     /// The answer, and the line it is about, for whoever is watching the
@@ -163,11 +216,6 @@ impl Painter {
             false => Some(self.pause.saturating_sub(self.changed.elapsed())),
         }
     }
-}
-
-/// The word a flag stands over, as the line has it.
-fn worded(line: &Line, span: &Range<usize>) -> String {
-    line.text.chars().take(span.end).skip(span.start).collect()
 }
 
 /// A flagged stretch of the line as it can actually be drawn: the characters
@@ -244,6 +292,13 @@ fn draw(runs: &[Run], look: &Look) -> Vec<u8> {
 
 #[cfg(test)]
 impl Painter {
+    /// The same painter with its decisions written down, for a test that reads
+    /// the account back.
+    pub fn logging(mut self, log: Log) -> Self {
+        self.log = log;
+        self
+    }
+
     /// A painter holding a checker already, with no pause to wait out.
     pub fn checking(checker: Box<dyn Checker + Send>) -> Self {
         Self {
@@ -254,6 +309,7 @@ impl Painter {
                 std::sync::mpsc::channel().1,
                 SharedChecked::default(),
                 SharedLearned::default(),
+                Log::off(),
             )
         }
     }
@@ -266,6 +322,7 @@ impl Painter {
             std::sync::mpsc::channel().1,
             SharedChecked::default(),
             SharedLearned::default(),
+            Log::off(),
         )
     }
 }
@@ -307,6 +364,7 @@ mod tests {
             self.1.fetch_add(1, Ordering::Relaxed);
             vec![Flag {
                 span: self.0.clone(),
+                class: crate::checker::Class::Spelling,
                 message: String::new(),
                 suggestions: Vec::new(),
             }]
@@ -400,6 +458,7 @@ mod tests {
             arriving,
             SharedChecked::default(),
             SharedLearned::default(),
+            Log::off(),
         );
         let drawn = box_holding("a teh word");
         assert!(
