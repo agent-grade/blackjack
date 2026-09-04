@@ -9,6 +9,7 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
 use crate::cli::Command;
+use crate::resolve;
 use crate::screen::{Screen, SharedScreen};
 use crate::tap::{InputTap, Log, Tap};
 
@@ -25,6 +26,10 @@ static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
 pub fn run(command: &Command) -> Result<u32> {
+    if let Err(failure) = resolve::check(&command.program) {
+        eprintln!("blackjack: {}: {failure}", command.program);
+        return Ok(failure.exit_code());
+    }
     let size = inherited_size();
     let pty = native_pty_system().openpty(size).context("opening a pty")?;
     let (cols, rows) = (size.cols as usize, size.rows as usize);
