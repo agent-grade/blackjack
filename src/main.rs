@@ -1,5 +1,6 @@
 mod checker;
 mod cli;
+mod harper;
 mod input;
 mod parser;
 mod pty;
