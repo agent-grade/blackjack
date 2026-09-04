@@ -347,7 +347,7 @@ mod tests {
 
     fn screen(cols: usize, rows: usize, bytes: &[u8]) -> Screen {
         let mut screen = Screen::new(cols, rows);
-        vte::Parser::new().advance(&mut screen, bytes);
+        crate::parser::Parser::new().advance(&mut screen, bytes);
         screen
     }
 
@@ -548,7 +548,7 @@ mod tests {
     fn a_resize_reaches_the_grid_held_behind_the_alternate_screen() {
         let mut screen = screen(10, 2, b"mainline\x1b[?1049h");
         screen.resize(20, 3);
-        vte::Parser::new().advance(&mut screen, b"\x1b[?1049l");
+        crate::parser::Parser::new().advance(&mut screen, b"\x1b[?1049l");
         assert_eq!(screen.line(0), "mainline");
         assert_eq!(screen.line(2), "");
     }
@@ -608,7 +608,7 @@ mod tests {
     fn a_resize_drops_the_scroll_region() {
         let mut screen = screen(10, 4, b"\x1b[3;4r");
         screen.resize(10, 2);
-        vte::Parser::new().advance(&mut screen, b"\x1b[1;1Ha\r\nb\r\nc");
+        crate::parser::Parser::new().advance(&mut screen, b"\x1b[1;1Ha\r\nb\r\nc");
         assert_eq!(screen.line(0), "b");
         assert_eq!(screen.line(1), "c");
     }
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn reconstructs_a_captured_claude_code_frame() {
         let mut screen = Screen::new(100, 40);
-        vte::Parser::new().advance(
+        crate::parser::Parser::new().advance(
             &mut screen,
             include_bytes!("../tests/fixtures/claude-tui-40x100.bin"),
         );

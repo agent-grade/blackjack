@@ -3,9 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use vte::Parser;
-
 use crate::input::{Event, Input};
+use crate::parser::Parser;
 use crate::screen::SharedScreen;
 
 const LOG_VAR: &str = "BLACKJACK_DEBUG_LOG";
@@ -160,4 +159,36 @@ fn escape(bytes: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::Screen;
+
+    /// Both taps are fed by a pty read, which cuts a character wherever it
+    /// happens to end. The models are only as true as the byte stream they are
+    /// handed, so each tap has to survive the cut.
+    fn split_reads() -> [&'static [u8]; 2] {
+        [b"\xc3", b"\xa9/\xe4\xb8\xad"]
+    }
+
+    #[test]
+    fn the_output_tap_tracks_a_character_split_across_two_reads() {
+        let screen = SharedScreen::new(Screen::new(10, 1).into());
+        let mut tap = Tap::new(Vec::new(), screen.clone(), Log(None));
+        for read in split_reads() {
+            tap.write_all(read).expect("write");
+        }
+        assert_eq!(screen.lock().expect("screen").line(0).trim_end(), "é/中");
+    }
+
+    #[test]
+    fn the_input_tap_tracks_a_character_split_across_two_reads() {
+        let mut tap = InputTap::new(Vec::new(), Log(None), false);
+        for read in split_reads() {
+            tap.write_all(read).expect("write");
+        }
+        assert_eq!(tap.input.line(), "é/中");
+    }
 }

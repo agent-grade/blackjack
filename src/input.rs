@@ -1,5 +1,6 @@
-use vte::{Params, Parser, Perform};
+use vte::{Params, Perform};
 
+use crate::parser::Parser;
 use crate::screen::param_as_written;
 
 const ESC: u8 = 0x1b;
@@ -398,11 +399,13 @@ mod tests {
     }
 
     /// A read returns whatever has arrived, which cuts a multi-byte character
-    /// in half often enough to matter for the wide words that started this.
+    /// in half often enough to matter for the wide words that started this. Fed
+    /// straight to vte 0.15, the second case reconstructs as `é中`.
     #[test]
     fn a_character_split_across_two_reads_arrives_once() {
         let wide = "中".as_bytes();
         assert_eq!(typed(&[&wide[..1], &wide[1..]]).line(), "中");
+        assert_eq!(typed(&[b"\xc3", b"\xa9/\xe4\xb8\xad"]).line(), "é/中");
     }
 
     #[test]
