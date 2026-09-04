@@ -1,4 +1,7 @@
+mod checker;
 mod cli;
+mod config;
+mod harper;
 mod input;
 mod parser;
 mod pty;
