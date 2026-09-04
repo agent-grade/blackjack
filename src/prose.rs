@@ -23,6 +23,25 @@ pub fn blanked(line: &str) -> String {
     prose
 }
 
+/// Whether a flag is about the line the user typed, or about the hole the
+/// filter left in it. A checker collapses the blanks and can read the words
+/// either side of a removed path as neighbours — so it will report a doubled
+/// word, or a run of spaces to close up, that is entirely this filter's own
+/// doing.
+///
+/// The test is only whether the flag reaches *across* something taken out, so
+/// it catches a rule whose subject is the gap and not one that merely read past
+/// it: an article looking at the word after `a` still sees whatever follows the
+/// hole. Blanking to something other than whitespace is what would retire that
+/// second kind, and this stays either way.
+pub fn intact(line: &str, prose: &str, span: &std::ops::Range<usize>) -> bool {
+    line.chars()
+        .zip(prose.chars())
+        .skip(span.start)
+        .take(span.end.saturating_sub(span.start))
+        .all(|(typed, asked)| typed == asked)
+}
+
 /// The tokens the filter took out — the answer to "why was that not checked",
 /// which is the question a filter this quiet will be asked.
 pub fn removed(line: &str) -> Vec<&str> {
@@ -211,6 +230,19 @@ mod tests {
         let line = "open src/pty.rs and fix teh `bug` now";
 
         assert_eq!(removed(line), ["src/pty.rs", "`bug`"]);
+    }
+
+    /// A flag reaching across a removed token is the filter's own doing, not
+    /// the user's: the checker saw two words as neighbours because the path
+    /// between them had become spaces.
+    #[test]
+    fn a_flag_across_something_removed_is_not_the_users() {
+        let line = "compare the src/a.rs the src/b.rs";
+        let prose = blanked(line);
+
+        assert!(!intact(line, &prose, &(8..24)), "the doubled `the`");
+        assert!(intact(line, &prose, &(8..11)), "one word of it");
+        assert!(intact(line, &prose, &(0..7)), "a word standing on its own");
     }
 
     /// A misspelling standing next to a path is still a misspelling.

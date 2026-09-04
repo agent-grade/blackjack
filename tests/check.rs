@@ -19,6 +19,19 @@ fn says_nothing_about_a_line_that_is_not_prose() {
     assert_eq!(check("src/pty.rs").1, "");
 }
 
+/// And nothing about the hole the filter leaves either. With the path taken
+/// out, a checker reads the words either side of it as neighbours and reports
+/// a doubled word that the user never typed — one the fix key would answer by
+/// deleting their path.
+#[test]
+fn says_nothing_about_words_a_removed_path_left_next_to_each_other() {
+    assert_eq!(check("compare the src/a.rs the src/b.rs").1, "");
+    assert!(
+        check("the the cat sat").1.starts_with("0..7"),
+        "a doubled word the user did type is still flagged"
+    );
+}
+
 /// Nothing wrong and nothing typed both print nothing, and neither is a
 /// failure — the exit code answers "did the check run", not "was it clean".
 #[test]

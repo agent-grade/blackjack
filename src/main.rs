@@ -74,11 +74,11 @@ fn check(text: &str) -> ExitCode {
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
     );
-    for flag in config
-        .checker(words.as_deref())
-        .check(&prose::blanked(text))
-    {
-        println!("{}", flagged(text, &flag));
+    let asked = prose::blanked(text);
+    for flag in config.checker(words.as_deref()).check(&asked) {
+        if prose::intact(text, &asked, &flag.span) {
+            println!("{}", flagged(text, &flag));
+        }
     }
     ExitCode::SUCCESS
 }

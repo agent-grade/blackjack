@@ -112,8 +112,12 @@ impl Painter {
             let Some(checker) = self.checker.as_mut() else {
                 return self.refused("no checker yet");
             };
-            let flags = checker.check(&prose::blanked(&line.text));
-            self.checked(&line.text, &flags);
+            let asked = prose::blanked(&line.text);
+            let (flags, across): (Vec<_>, Vec<_>) = checker
+                .check(&asked)
+                .into_iter()
+                .partition(|flag| prose::intact(&line.text, &asked, &flag.span));
+            self.checked(&line.text, &flags, &across);
             self.publish(&line.text, &flags);
             self.flags = Some(flags);
         }
@@ -172,19 +176,16 @@ impl Painter {
     /// What was asked and what came back: the line as the user typed it, the
     /// tokens the filter took out before the checker saw it, and where the
     /// answers landed.
-    fn checked(&self, line: &str, flags: &[Flag]) {
+    fn checked(&self, line: &str, flags: &[Flag], across: &[Flag]) {
         if !self.log.is_on() {
             return;
         }
-        let spans: Vec<String> = flags
-            .iter()
-            .map(|flag| format!("{}..{}", flag.span.start, flag.span.end))
-            .collect();
         self.log.line(format_args!(
-            "check \"{}\" not prose {:?} flags [{}]",
+            "check \"{}\" not prose {:?} flags [{}] across removed [{}]",
             crate::log::escape(line.as_bytes()),
             prose::removed(line),
-            spans.join(" ")
+            spanned(flags),
+            spanned(across)
         ));
     }
 
@@ -216,6 +217,15 @@ impl Painter {
             false => Some(self.pause.saturating_sub(self.changed.elapsed())),
         }
     }
+}
+
+/// Spans as a log line lists them.
+fn spanned(flags: &[Flag]) -> String {
+    flags
+        .iter()
+        .map(|flag| format!("{}..{}", flag.span.start, flag.span.end))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A flagged stretch of the line as it can actually be drawn: the characters
@@ -653,6 +663,35 @@ mod tests {
         let flagged = flagged.expect("the misspelling beside it");
         assert!(flagged.contains("teh"), "{flagged:?}");
         assert!(!flagged.contains("src"), "{flagged:?}");
+    }
+
+    /// A checker reads the filter's blanks as ordinary space, so it can report
+    /// the words either side of a removed path as neighbours. Such a flag is
+    /// about the hole, not the line, and nothing is drawn for it — while the
+    /// same words on their own are still underlined.
+    #[test]
+    fn a_flag_reaching_across_a_removed_path_is_not_painted() {
+        let drawn = box_holding("to ~/a to");
+
+        let (mut painter, _) = spanning(0..9);
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted a changed line"
+        );
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "underlined the filter's own work"
+        );
+
+        let (mut painter, _) = spanning(0..2);
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted a changed line"
+        );
+        assert!(
+            ask(&mut painter, &drawn).is_some(),
+            "the word on its own is still flagged"
+        );
     }
 
     /// A word the user has taught the wrapper is no longer underlined, and it

@@ -38,10 +38,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             dict_path: None,
-            grammar: ["articles", "its-its", "lets-lets"]
-                .iter()
-                .map(|class| (*class).to_string())
-                .collect(),
+            grammar: crate::harper::classes().map(str::to_string).collect(),
             pause_ms: 400,
             fix_key: "ctrl+.".to_string(),
             learn_key: "ctrl+,".to_string(),
@@ -207,7 +204,20 @@ mod tests {
     fn the_defaults_watch_every_class_and_pause_for_400ms() {
         let config = Config::default();
 
-        assert_eq!(config.grammar, ["articles", "its-its", "lets-lets"]);
+        for class in [
+            "articles",
+            "its-its",
+            "lets-lets",
+            "repeated",
+            "spacing",
+            "to-too",
+            "then-than",
+        ] {
+            assert!(
+                config.grammar.iter().any(|watched| watched == class),
+                "{class} is not watched by default"
+            );
+        }
         assert_eq!(config.pause(), Duration::from_millis(400));
         assert_eq!(config.dict_path, None);
     }

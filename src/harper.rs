@@ -10,17 +10,56 @@ use harper_core::{Dialect, DictWordMetadata, Document};
 use crate::checker::{Checker, Class, Edit, Flag};
 
 /// The curated grammar classes and the harper rules each one turns on. Harper
-/// ships some seven hundred rules; everything outside this table stays off, so
+/// ships 828 curated rules; everything outside this table stays off, so
 /// the overlay only ever speaks about the slips it was asked to watch for.
 const CLASSES: &[(&str, &[&str])] = &[
+    // The wrong indefinite article, which the finger picks before the word is.
     ("articles", &["AnA"]),
+    // `its` for `it's` and back, the apostrophe rule that inverts between them.
     ("its-its", &["ItsContraction", "ItsPossessive"]),
+    // `lets` for `let's`, the same inversion on another word.
     ("lets-lets", &["LetsConfusion"]),
+    // A word typed twice across a line break or a pause — the slip a fast
+    // typist makes most and reads over every time.
+    ("repeated", &["RepeatedWords"]),
+    // Two spaces where one was meant. Its subject is the gap between words,
+    // which is what the prose filter leaves wherever it takes a path out — so
+    // it is usable only because a flag reaching across a removed token is
+    // declined before anyone sees it. Measured with that in place: nothing at
+    // all on a filtered line, and a doubled space the user typed still caught.
+    ("spacing", &["Spaces", "NoFrenchSpaces"]),
+    // `too` where the infinitive marker was meant.
+    ("to-too", &["ToTwoToo"]),
+    // `then` for a comparison, which is `than`.
+    ("then-than", &["ThenThan"]),
 ];
+
+// Deliberately out, and why. `LongSentences`, `BoringWords`, `FillerWords`,
+// `Hedging`, `AvoidContractions` and `AvoidCurses` police how a person writes
+// rather than catch what they mistyped, and this is pointed at a prompt, not an
+// essay. `CapitalizePersonalPronouns` was tried and dropped: a bare `i` is a
+// loop variable in six of fourteen prompts about code, and being a grammar flag
+// it cannot be learned away — the wrapper would be arguing with a variable name
+// all day to catch a lowercase pronoun. `TheyreConfusions`, `PossessiveYour`,
+// `Theres` and `ThatThan` were tried and dropped for the opposite reason: none
+// of them fired on the slip it is named for, and a class whose rule never
+// speaks is a line of config that does nothing.
+//
+// Harper 2.8.0 has no single `Matcher` rule to turn on: its curated group holds
+// 828 separately named rules, most of them one phrase each, so a `phrases`
+// class would be a list nobody could keep curated — the confusions worth having
+// are named above.
 
 /// Harper's name for the spell checker. It is always on: spelling is why the
 /// overlay exists, and it is the one check that is not a curated class.
 const SPELL_CHECK: &str = "SpellCheck";
+
+/// Every grammar class there is, which is what the defaults turn on: a class is
+/// added here to be watched, and the config's job is to silence one, not to
+/// discover it.
+pub fn classes() -> impl Iterator<Item = &'static str> {
+    CLASSES.iter().map(|(class, _)| *class)
+}
 
 pub struct HarperChecker {
     dictionary: Arc<MergedDictionary>,
@@ -145,14 +184,14 @@ mod tests {
 
     use super::*;
 
-    const EVERY_CLASS: [&str; 3] = ["articles", "its-its", "lets-lets"];
-
-    fn classes(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_string()).collect()
+    /// Every class there is, so a class added to the table is a class these
+    /// tests watch without anyone remembering to add it here too.
+    fn every_class() -> Vec<String> {
+        super::classes().map(str::to_string).collect()
     }
 
     fn checker() -> HarperChecker {
-        HarperChecker::new(&classes(&EVERY_CLASS), None)
+        HarperChecker::new(&every_class(), None)
     }
 
     /// A word list written where the test can reach it, named after the test so
@@ -234,6 +273,42 @@ mod tests {
         assert_eq!(checker().check("This is an mule.")[0].class, Class::Grammar);
     }
 
+    /// The slips the wider table was added for, each flagged by the class that
+    /// names it. A class whose rule never fires on the slip it is for is a line
+    /// of config that does nothing.
+    #[test]
+    fn every_class_flags_the_slip_it_was_added_for() {
+        for (line, meant) in [
+            ("the the cat sat", "the"),
+            ("Its a test", "It's"),
+            ("a  double space", " "),
+            ("i went too the store", "to"),
+            ("its bigger then i thought", "than"),
+            ("This is an mule.", "a"),
+            ("Lets try that again.", "Let's"),
+        ] {
+            let flags = checker().check(line);
+            assert!(
+                flags
+                    .iter()
+                    .any(|flag| flag.suggestions.contains(&Edit::Replace(meant.into()))),
+                "{line:?} was not offered {meant:?}: {flags:?}"
+            );
+        }
+    }
+
+    /// A doubled word is one flag over two words, which is the first span the
+    /// curated table produces that covers more than one — the fix has to take
+    /// out both and put one back.
+    #[test]
+    fn a_doubled_word_is_one_flag_over_both_of_them() {
+        let flags = checker().check("the the cat sat");
+
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].span, 0..7);
+        assert_eq!(flags[0].class, Class::Grammar);
+    }
+
     #[test]
     fn nothing_outside_the_curated_classes_is_flagged() {
         let mut checker = checker();
@@ -268,7 +343,7 @@ mod tests {
 
         assert_eq!(checker().check("undercurl the DECSTBM").len(), 2);
         assert_eq!(
-            HarperChecker::new(&classes(&EVERY_CLASS), Some(&path))
+            HarperChecker::new(&every_class(), Some(&path))
                 .check("undercurl the DECSTBM")
                 .len(),
             0
@@ -294,7 +369,7 @@ mod tests {
     fn a_word_list_that_cannot_be_read_is_not_fatal() {
         let missing = std::env::temp_dir().join("blackjack-no-such-word-list.txt");
 
-        let flags = HarperChecker::new(&classes(&EVERY_CLASS), Some(&missing)).check("teh cat");
+        let flags = HarperChecker::new(&every_class(), Some(&missing)).check("teh cat");
 
         assert_eq!(flags.len(), 1);
     }
