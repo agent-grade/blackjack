@@ -1,3 +1,4 @@
+mod checker;
 mod cli;
 mod input;
 mod parser;
