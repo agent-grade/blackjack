@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 use crate::checker::{Checker, Flag};
-use crate::picker::SharedChecked;
+use crate::picker::{SharedChecked, SharedLearned};
+use crate::prose;
 use crate::screen::{Line, Look};
 
 const PAINT_OFF: &str = "BLACKJACK_PAINT_OFF";
@@ -32,6 +33,10 @@ pub struct Painter {
     /// What the checker said, left where the keystroke side can read it: the
     /// picker runs there and the checking runs here.
     checked: SharedChecked,
+    /// And what the user has since said back. Read on every paint rather than
+    /// on every check, so a word learned now stops being underlined at the next
+    /// frame instead of the next time the line is asked about.
+    learned: SharedLearned,
 }
 
 impl Painter {
@@ -48,6 +53,7 @@ impl Painter {
         pause: Duration,
         arriving: Receiver<Box<dyn Checker + Send>>,
         checked: SharedChecked,
+        learned: SharedLearned,
     ) -> Self {
         Self {
             on,
@@ -58,6 +64,7 @@ impl Painter {
             changed: Instant::now(),
             flags: None,
             checked,
+            learned,
         }
     }
 
@@ -93,16 +100,22 @@ impl Painter {
             if self.changed.elapsed() < self.pause {
                 return None;
             }
-            let flags = self.checker.as_mut()?.check(&line.text);
+            // Asked about the prose only: a checker has nothing useful to say
+            // about a path or a flag, and everything it says about one is noise
+            // over something the user typed on purpose.
+            let flags = self.checker.as_mut()?.check(&prose::blanked(&line.text));
             self.publish(&line.text, &flags);
             self.flags = Some(flags);
         }
+        let learned = self.learned.lock().ok()?;
         let runs: Vec<_> = self
             .flags
             .iter()
             .flatten()
+            .filter(|flag| !learned.contains(&worded(line, &flag.span)))
             .flat_map(|flag| runs_of(line, &flag.span))
             .collect();
+        drop(learned);
         if runs.is_empty() {
             return None;
         }
@@ -150,6 +163,11 @@ impl Painter {
             false => Some(self.pause.saturating_sub(self.changed.elapsed())),
         }
     }
+}
+
+/// The word a flag stands over, as the line has it.
+fn worded(line: &Line, span: &Range<usize>) -> String {
+    line.text.chars().take(span.end).skip(span.start).collect()
 }
 
 /// A flagged stretch of the line as it can actually be drawn: the characters
@@ -235,6 +253,7 @@ impl Painter {
                 Duration::ZERO,
                 std::sync::mpsc::channel().1,
                 SharedChecked::default(),
+                SharedLearned::default(),
             )
         }
     }
@@ -246,6 +265,7 @@ impl Painter {
             Duration::ZERO,
             std::sync::mpsc::channel().1,
             SharedChecked::default(),
+            SharedLearned::default(),
         )
     }
 }
@@ -374,7 +394,13 @@ mod tests {
     #[test]
     fn nothing_is_painted_before_the_checker_arrives() {
         let (built, arriving) = std::sync::mpsc::channel();
-        let mut painter = Painter::open(true, Duration::ZERO, arriving, SharedChecked::default());
+        let mut painter = Painter::open(
+            true,
+            Duration::ZERO,
+            arriving,
+            SharedChecked::default(),
+            SharedLearned::default(),
+        );
         let drawn = box_holding("a teh word");
         assert!(
             ask(&mut painter, &drawn).is_none(),
@@ -548,6 +574,66 @@ mod tests {
         assert!(!paint.contains("\x1b[0m"), "{paint:?}");
         assert!(!paint.contains("\x1b[22m"), "{paint:?}");
         assert!(!paint.contains("\x1b[2m"), "{paint:?}");
+    }
+
+    /// The real engine on a real terminal line: a path is three words to a
+    /// dictionary and every one of them is wrong, which is the noise that makes
+    /// a user switch the wrapper off. Nothing of it reaches the checker.
+    #[test]
+    fn a_path_is_not_underlined_and_a_misspelling_beside_it_still_is() {
+        let engine = || Box::new(crate::harper::HarperChecker::new(&[], None));
+
+        // The box in these tests is twenty columns wide, so the line is short.
+        let quiet = paint_of(&mut Painter::checking(engine()), &box_holding("src/pty.rs"));
+        let flagged = paint_of(
+            &mut Painter::checking(engine()),
+            &box_holding("src/pty.rs teh"),
+        );
+
+        assert!(quiet.is_none(), "underlined a path: {quiet:?}");
+        let flagged = flagged.expect("the misspelling beside it");
+        assert!(flagged.contains("teh"), "{flagged:?}");
+        assert!(!flagged.contains("src"), "{flagged:?}");
+    }
+
+    /// A word the user has taught the wrapper is no longer underlined, and it
+    /// stops being underlined at the next paint rather than the next check —
+    /// the line has not changed, so nothing would ask about it again.
+    #[test]
+    fn a_word_the_user_has_learned_is_not_underlined() {
+        let learned = SharedLearned::default();
+        let mut painter = Painter::checking(Box::new(FakeChecker::spelling(&["teh"])));
+        painter.learned = learned.clone();
+        let drawn = box_holding("a teh word");
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted a changed line"
+        );
+        assert!(
+            ask(&mut painter, &drawn).is_some(),
+            "the flag was never there"
+        );
+
+        learned.lock().expect("learned").insert("teh".to_string());
+
+        assert!(ask(&mut painter, &drawn).is_none());
+    }
+
+    /// What is learned is a word, not a place in the line: another word at the
+    /// same span is a different word and is underlined as before.
+    #[test]
+    fn learning_one_word_leaves_the_next_one_flagged() {
+        let learned = SharedLearned::default();
+        learned.lock().expect("learned").insert("teh".to_string());
+        let mut painter = Painter::checking(Box::new(FakeChecker::spelling(&["teh", "hte"])));
+        painter.learned = learned;
+        let drawn = box_holding("a hte word");
+
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted a changed line"
+        );
+        assert!(ask(&mut painter, &drawn).is_some());
     }
 
     /// One flag can cover more than one row — a phrase the box wrapped — and is

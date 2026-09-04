@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,7 @@ use crate::cli::Command;
 use crate::config::Config;
 use crate::input::{Input, SharedInput};
 use crate::painter::Painter;
-use crate::picker::{Chord, Picker, SharedChecked};
+use crate::picker::{Chord, Picker, SharedChecked, SharedLearned};
 use crate::resolve;
 use crate::screen::{Screen, SharedScreen};
 use crate::tap::{InputTap, Log, Tap};
@@ -64,9 +65,16 @@ pub fn run(command: &Command) -> Result<u32> {
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
     let painting = Painter::wanted();
-    let (pause, chord, arriving) = configured(painting);
+    let (pause, keys, arriving) = configured(painting);
     let checked = SharedChecked::default();
-    let picker = Picker::new(chord, Arc::clone(&checked));
+    let learned = SharedLearned::default();
+    let picker = Picker::new(
+        keys.fix,
+        keys.learn,
+        Arc::clone(&checked),
+        Arc::clone(&learned),
+        keys.words,
+    );
 
     let piped_stdin = !std::io::stdin().is_terminal();
     let input: SharedInput = Arc::new(Mutex::new(Input::new(piped_stdin)));
@@ -99,7 +107,7 @@ pub fn run(command: &Command) -> Result<u32> {
         std::io::stdout(),
         screen,
         input,
-        Painter::open(painting, pause, arriving, Arc::clone(&checked)),
+        Painter::open(painting, pause, arriving, Arc::clone(&checked), learned),
         log,
     );
     // The read moves to its own thread so that this one can wait on a timer as
@@ -190,18 +198,45 @@ fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
 /// Switched off, none of it happens — no config is read, no dictionary is
 /// built, and the channel it would have arrived on is closed from the start;
 /// the chord is the default one, which nothing will ask for.
-fn configured(wanted: bool) -> (Duration, Chord, Receiver<Box<dyn Checker + Send>>) {
+fn configured(wanted: bool) -> (Duration, Keys, Receiver<Box<dyn Checker + Send>>) {
+    let (xdg, home) = (
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    );
     if !wanted {
         let quiet = Config::default();
-        return (Duration::ZERO, quiet.chord(), std::sync::mpsc::channel().1);
+        let keys = Keys::of(&quiet, xdg, home);
+        return (Duration::ZERO, keys, std::sync::mpsc::channel().1);
     }
     let config = Config::load();
-    let (pause, chord) = (config.pause(), config.chord());
+    let keys = Keys::of(&config, xdg, home);
+    let (pause, words) = (config.pause(), keys.words.clone());
     let (built, arriving) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = built.send(config.checker());
+        let _ = built.send(config.checker(words.as_deref()));
     });
-    (pause, chord, arriving)
+    (pause, keys, arriving)
+}
+
+/// The two keys the wrapper answers to itself, and where a learned word goes.
+struct Keys {
+    fix: Chord,
+    learn: Chord,
+    words: Option<PathBuf>,
+}
+
+impl Keys {
+    fn of(
+        config: &Config,
+        xdg: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    ) -> Self {
+        Self {
+            fix: config.chord(),
+            learn: config.learn_chord(),
+            words: config.words_path(xdg, home),
+        }
+    }
 }
 
 /// How the output side stopped.

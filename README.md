@@ -35,6 +35,10 @@ pause_ms = 400
 # suggestion. Press it again for the next one, and once more past the last to
 # get your own word back. Modifiers joined by `+`, then the character.
 fix_key = "ctrl+."
+
+# The key that adds the flagged word under the cursor to the word list above,
+# so it stops being flagged — now, and in every session after this one.
+learn_key = "ctrl+,"
 ```
 
 ## Acknowledgements

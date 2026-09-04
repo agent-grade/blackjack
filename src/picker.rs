@@ -1,8 +1,13 @@
-//! Turning a flagged word into one of its suggestions, without the user
-//! leaving the keyboard. No menu is drawn: pressing the key again is how the
-//! next suggestion is asked for, and pressing anything else is how the offer
-//! is declined.
+//! The two answers to a flagged word, without the user leaving the keyboard:
+//! taking one of its suggestions, or teaching the wrapper that the word was
+//! right all along. No menu is drawn for either — pressing the fix key again
+//! is how the next suggestion is asked for, and pressing anything else is how
+//! the offer is declined. A learned word is kept for the session and written
+//! to the user's list for every session after it.
 
+use std::collections::BTreeSet;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::checker::{Edit, Flag};
@@ -77,6 +82,12 @@ pub struct Checked {
 
 pub type SharedChecked = Arc<Mutex<Checked>>;
 
+/// The words the user has told the wrapper to stop objecting to. They are held
+/// here rather than given to the engine because an engine's dictionary is built
+/// once, and the whole point is that a word learned now stops being underlined
+/// now.
+pub type SharedLearned = Arc<Mutex<BTreeSet<String>>>;
+
 /// A fix in progress. The stretch of the line between `at` and `at + standing`
 /// is what the last press left behind; pressing again takes it out and puts
 /// the next suggestion in its place.
@@ -93,17 +104,81 @@ struct Cycling {
 
 pub struct Picker {
     chord: Chord,
+    learn: Chord,
     checked: SharedChecked,
+    learned: SharedLearned,
+    /// Where a learned word is written down, so that it is still learned
+    /// tomorrow. Nowhere, if the user has no home to put it in.
+    words: Option<PathBuf>,
     cycling: Option<Cycling>,
 }
 
 impl Picker {
-    pub fn new(chord: Chord, checked: SharedChecked) -> Self {
+    pub fn new(
+        chord: Chord,
+        learn: Chord,
+        checked: SharedChecked,
+        learned: SharedLearned,
+        words: Option<PathBuf>,
+    ) -> Self {
         Self {
             chord,
+            learn,
             checked,
+            learned,
+            words,
             cycling: None,
         }
+    }
+
+    /// The word under the cursor, taken as one the user meant. It is remembered
+    /// for this session and written down for the next; the underline goes at
+    /// the next paint, since what is flagged is filtered through what has been
+    /// learned rather than asked about again.
+    pub fn learn(&mut self, line: &str, cursor: usize) -> Option<()> {
+        let word = {
+            let checked = self.checked.lock().ok()?;
+            if checked.line != line {
+                return None;
+            }
+            let flag = checked.flags.iter().find(|flag| covers(flag, cursor))?;
+            let characters: Vec<char> = line.chars().collect();
+            if flag.span.end > characters.len() {
+                return None;
+            }
+            characters[flag.span.clone()].iter().collect::<String>()
+        };
+        if word.is_empty() || !self.learned.lock().ok()?.insert(word.clone()) {
+            // Already known: the keystroke has nothing to do, so it belongs to
+            // the wrapped program after all.
+            return None;
+        }
+        self.write_down(&word);
+        Some(())
+    }
+
+    /// One word per line, appended. A list that cannot be written is a list the
+    /// user loses tomorrow, which is worth a line on stderr and nothing more —
+    /// the word is learned for this session either way.
+    fn write_down(&self, word: &str) {
+        let Some(path) = &self.words else {
+            return;
+        };
+        if let Some(directory) = path.parent() {
+            let _ = std::fs::create_dir_all(directory);
+        }
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{word}"));
+        if let Err(error) = written {
+            eprintln!("blackjack: {}: {error}", path.display());
+        }
+    }
+
+    pub fn is_learn(&self, keys: &[u8]) -> bool {
+        self.learn.matches(keys)
     }
 
     /// The keystrokes to send in place of the chord, given the line the model
@@ -138,10 +213,7 @@ impl Picker {
         if checked.line != line {
             return None;
         }
-        let flag = checked
-            .flags
-            .iter()
-            .find(|flag| (flag.span.start..=flag.span.end).contains(&cursor))?;
+        let flag = checked.flags.iter().find(|flag| covers(flag, cursor))?;
         cycling_over(line, flag)
     }
 
@@ -177,6 +249,12 @@ impl Picker {
         });
         keys
     }
+}
+
+/// A flag is the one being asked about when the cursor is inside it or has
+/// just left it — the word being typed is the word in question.
+fn covers(flag: &Flag, cursor: usize) -> bool {
+    (flag.span.start..=flag.span.end).contains(&cursor)
 }
 
 /// The stretch a fix stands over and the texts that can stand in it. A removal
@@ -232,12 +310,30 @@ mod tests {
     }
 
     fn picking(line: &str, flags: Vec<Flag>) -> Picker {
+        learning(line, flags).0
+    }
+
+    /// A picker with both keys, and the list a learned word is written to.
+    fn learning(line: &str, flags: Vec<Flag>) -> (Picker, SharedLearned, PathBuf) {
         let checked = SharedChecked::default();
         *checked.lock().expect("checked") = Checked {
             line: line.to_string(),
             flags,
         };
-        Picker::new(Chord::parse("ctrl+.").expect("a chord"), checked)
+        let learned = SharedLearned::default();
+        let words = std::env::temp_dir().join(format!(
+            "blackjack-words-{}-{:p}.txt",
+            std::process::id(),
+            &checked
+        ));
+        let picker = Picker::new(
+            Chord::parse("ctrl+.").expect("a chord"),
+            Chord::parse("ctrl+,").expect("a chord"),
+            checked,
+            learned.clone(),
+            Some(words.clone()),
+        );
+        (picker, learned, words)
     }
 
     /// The modifiers the user writes, in the order they feel like writing them,
@@ -407,6 +503,59 @@ mod tests {
             b"\x7f\x7f\x7f\x7f"
         );
         assert_eq!(picker.fix("one", 3).expect("replacement"), b" the");
+    }
+
+    /// A word the user meant is written down where the next session will read
+    /// it, once — a list that gains the same word twice is a list that grows
+    /// every time they press the key.
+    #[test]
+    fn a_learned_word_is_written_down_once() {
+        let (mut picker, learned, words) = learning(
+            "a parkin",
+            vec![flag(2..8, &[Edit::Replace("parking".into())])],
+        );
+
+        assert_eq!(picker.learn("a parkin", 8), Some(()));
+
+        assert_eq!(
+            std::fs::read_to_string(&words).expect("the list"),
+            "parkin\n"
+        );
+        assert!(learned.lock().expect("learned").contains("parkin"));
+        std::fs::remove_file(&words).ok();
+    }
+
+    /// Pressing it again on a word already known has nothing to do, so the
+    /// keystroke belongs to the wrapped program after all.
+    #[test]
+    fn learning_a_word_twice_is_a_keystroke_the_program_gets() {
+        let (mut picker, _, words) = learning(
+            "a parkin",
+            vec![flag(2..8, &[Edit::Replace("parking".into())])],
+        );
+        picker.learn("a parkin", 8).expect("learned");
+
+        assert_eq!(picker.learn("a parkin", 8), None);
+
+        assert_eq!(
+            std::fs::read_to_string(&words).expect("the list"),
+            "parkin\n"
+        );
+        std::fs::remove_file(&words).ok();
+    }
+
+    /// The same rule as the fix key: it answers for the word under the cursor
+    /// and for nothing else.
+    #[test]
+    fn learning_needs_a_flag_under_the_cursor_too() {
+        let (mut picker, learned, _) = learning(
+            "a parkin word",
+            vec![flag(2..8, &[Edit::Replace("parking".into())])],
+        );
+
+        assert_eq!(picker.learn("a parkin word", 13), None);
+
+        assert!(learned.lock().expect("learned").is_empty());
     }
 
     /// The flags are a reading of one particular line. Typed past, they are

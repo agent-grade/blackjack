@@ -219,17 +219,27 @@ impl<W: Write> InputTap<W> {
     /// the flagged word under the cursor into a suggestion, and those go to the
     /// wrapped program instead of it — the program is never told about a key it
     /// does not have a meaning for, and gets only keystrokes it does.
-    /// Everything else passes, and ends whatever cycle was running.
+    /// Everything else passes, and every keystroke that is not the fix key ends
+    /// whatever cycle was running — the learn key included, since it is a
+    /// different question about the same word.
     fn instead_of(&mut self, keys: &[u8]) -> Option<Vec<u8>> {
-        if !self.picker.is_chord(keys) {
+        let fixing = self.picker.is_chord(keys);
+        if !fixing {
             self.picker.interrupted();
-            return None;
+            if !self.picker.is_learn(keys) {
+                return None;
+            }
         }
         let (line, cursor) = {
             let input = self.input.lock().ok()?;
             (input.line().to_string(), input.cursor())
         };
-        self.picker.fix(&line, cursor)
+        match fixing {
+            true => self.picker.fix(&line, cursor),
+            // Nothing is typed for a word learned: the keystroke is answered by
+            // the underline going, which the next paint does on its own.
+            false => self.picker.learn(&line, cursor).map(|()| Vec::new()),
+        }
     }
 }
 
@@ -324,7 +334,10 @@ mod tests {
         publish(&checked, line, flags);
         let picker = Picker::new(
             crate::picker::Chord::parse("ctrl+.").expect("a chord"),
+            crate::picker::Chord::parse("ctrl+,").expect("a chord"),
             checked.clone(),
+            crate::picker::SharedLearned::default(),
+            None,
         );
         (
             input.clone(),
@@ -359,7 +372,10 @@ mod tests {
     fn idle_picker() -> Picker {
         Picker::new(
             crate::picker::Chord::parse("ctrl+.").expect("a chord"),
+            crate::picker::Chord::parse("ctrl+,").expect("a chord"),
             crate::picker::SharedChecked::default(),
+            crate::picker::SharedLearned::default(),
+            None,
         )
     }
 
@@ -600,6 +616,56 @@ mod tests {
         assert_eq!(
             keys.to, b"\x7f\x7f\x7fthe",
             "the second offer, not the first"
+        );
+        assert_eq!(input.lock().expect("input").line(), "a the");
+    }
+
+    /// The learn key is the wrapper's own, and the wrapper answers it: nothing
+    /// is typed for a word learned, since what the press asks for is the
+    /// underline going, which the next paint does on its own.
+    #[test]
+    fn the_learn_key_is_answered_by_the_wrapper_not_the_program() {
+        let (input, _checked, mut keys) =
+            picking("a teh", flagging(2..5, &[Edit::Replace("the".into())]));
+
+        keys.write_all(b"\x1b[44;5u").expect("the learn key");
+
+        assert!(keys.to.is_empty(), "{:?}", keys.to);
+        assert_eq!(input.lock().expect("input").line(), "a teh");
+    }
+
+    /// Pressing it again over a word already learned has nothing left to do,
+    /// so the key belongs to the wrapped program after all and arrives exactly
+    /// as it was pressed.
+    #[test]
+    fn learning_a_word_twice_hands_the_second_press_to_the_program() {
+        let (_input, _checked, mut keys) =
+            picking("a teh", flagging(2..5, &[Edit::Replace("the".into())]));
+        keys.write_all(b"\x1b[44;5u").expect("the learn key");
+        keys.to.clear();
+
+        keys.write_all(b"\x1b[44;5u").expect("the learn key again");
+
+        assert_eq!(keys.to, b"\x1b[44;5u");
+    }
+
+    /// It is not the fix key, so it ends a cycle the fix key was in the middle
+    /// of: the press after it asks the question again rather than handing over
+    /// the next answer to a question nobody is still asking.
+    #[test]
+    fn the_learn_key_ends_a_running_fix_cycle() {
+        let offers = [Edit::Replace("the".into()), Edit::Replace("tea".into())];
+        let (input, checked, mut keys) = picking("a teh", flagging(2..5, &offers));
+        keys.write_all(b"\x1b[46;5u").expect("the fix key");
+        keys.write_all(b"\x1b[44;5u").expect("the learn key");
+        publish(&checked, "a the", flagging(2..5, &offers));
+        keys.to.clear();
+
+        keys.write_all(b"\x1b[46;5u").expect("the fix key again");
+
+        assert_eq!(
+            keys.to, b"\x7f\x7f\x7fthe",
+            "the offers were asked for again, not walked on"
         );
         assert_eq!(input.lock().expect("input").line(), "a the");
     }

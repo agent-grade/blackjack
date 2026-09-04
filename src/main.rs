@@ -6,6 +6,7 @@ mod input;
 mod painter;
 mod parser;
 mod picker;
+mod prose;
 mod pty;
 mod resolve;
 mod screen;

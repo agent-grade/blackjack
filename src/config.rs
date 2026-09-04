@@ -14,6 +14,7 @@ use crate::picker::Chord;
 
 const DIRECTORY: &str = "blackjack";
 const FILE: &str = "config.toml";
+const WORDS: &str = "words.txt";
 
 /// Everything the user gets to decide. A key left out keeps its default, so an
 /// empty file and no file at all mean the same thing.
@@ -29,6 +30,8 @@ pub struct Config {
     /// The key that fixes the flagged word under the cursor: the modifiers
     /// held down, joined by `+`, and then the character.
     pub fix_key: String,
+    /// The key that adds the flagged word under the cursor to `dict_path`.
+    pub learn_key: String,
 }
 
 impl Default for Config {
@@ -41,6 +44,7 @@ impl Default for Config {
                 .collect(),
             pause_ms: 400,
             fix_key: "ctrl+.".to_string(),
+            learn_key: "ctrl+,".to_string(),
         }
     }
 }
@@ -67,15 +71,35 @@ impl Config {
     /// Same as everything else here: a line the user got wrong costs them that
     /// line's setting and nothing more.
     pub fn chord(&self) -> Chord {
-        Chord::parse(&self.fix_key)
-            .or_else(|| Chord::parse(&Self::default().fix_key))
-            .expect("the default chord parses")
+        Self::keyed(&self.fix_key, &Self::default().fix_key)
     }
 
-    /// The configured engine. The wrapper asks for a checker and never learns
+    pub fn learn_chord(&self) -> Chord {
+        Self::keyed(&self.learn_key, &Self::default().learn_key)
+    }
+
+    fn keyed(written: &str, fallback: &str) -> Chord {
+        Chord::parse(written)
+            .or_else(|| Chord::parse(fallback))
+            .expect("the default chords parse")
+    }
+
+    /// The word list, which is one file for both sides: what the user has
+    /// taught the wrapper is written here and read back from here. Their own
+    /// list if they named one, and otherwise the file the README says is
+    /// theirs — next to the config, whether or not either exists yet.
+    pub fn words_path(&self, xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+        self.dict_path
+            .clone()
+            .or_else(|| config_path(xdg, home).map(|config| config.with_file_name(WORDS)))
+    }
+
+    /// The configured engine, given the word list to start from — the same
+    /// file a learned word is appended to, so a word taught in one session is
+    /// known to the next one. The wrapper asks for a checker and never learns
     /// which one it got, which is the whole point of the trait.
-    pub fn checker(&self) -> Box<dyn Checker + Send> {
-        Box::new(HarperChecker::new(&self.grammar, self.dict_path.as_deref()))
+    pub fn checker(&self, words: Option<&Path>) -> Box<dyn Checker + Send> {
+        Box::new(HarperChecker::new(&self.grammar, words))
     }
 
     fn read(path: &Path, home: Option<OsString>) -> Self {
@@ -168,7 +192,7 @@ mod tests {
     fn a_config_the_user_wrote_is_read_whole() {
         let path = config_file(
             "whole",
-            "dict_path = \"/words.txt\"\ngrammar = [\"articles\"]\npause_ms = 120\nfix_key = \"alt+f\"\n",
+            "dict_path = \"/words.txt\"\ngrammar = [\"articles\"]\npause_ms = 120\nfix_key = \"alt+f\"\nlearn_key = \"alt+l\"\n",
         );
 
         let config = Config::read(&path, home());
@@ -177,6 +201,42 @@ mod tests {
         assert_eq!(config.grammar, ["articles"]);
         assert_eq!(config.pause(), Duration::from_millis(120));
         assert_eq!(config.chord(), Chord::parse("alt+f").expect("a chord"));
+        assert_eq!(
+            config.learn_chord(),
+            Chord::parse("alt+l").expect("a chord")
+        );
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// A word list the user did not name still has a home: the file the README
+    /// says is theirs, beside the config, whether or not it exists yet.
+    #[test]
+    fn a_learned_word_has_somewhere_to_go_without_a_dict_path() {
+        let default = Config::default();
+
+        assert_eq!(
+            default.words_path(None, Some(OsString::from("/somewhere"))),
+            Some(PathBuf::from("/somewhere/.config/blackjack/words.txt"))
+        );
+        assert_eq!(
+            default.words_path(Some(OsString::from("/config")), home()),
+            Some(PathBuf::from("/config/blackjack/words.txt")),
+            "the config directory the user named"
+        );
+    }
+
+    /// And the user's own list is where their words go when they named one.
+    #[test]
+    fn a_named_word_list_is_where_learned_words_go() {
+        let path = config_file("named-words", "dict_path = \"/mine.txt\"\n");
+
+        let config = Config::read(&path, home());
+
+        assert_eq!(
+            config.words_path(None, home()),
+            Some(PathBuf::from("/mine.txt"))
+        );
 
         fs::remove_file(&path).unwrap();
     }
@@ -287,9 +347,36 @@ mod tests {
         );
     }
 
+    /// The list a learned word is written to is the list the checker starts
+    /// from, so a word taught in one session is a word the next one knows.
+    #[test]
+    fn a_word_in_the_list_is_known_to_the_checker_built_from_it() {
+        let config = Config::default();
+        let words = config
+            .words_path(Some(OsString::from(&temporary())), None)
+            .expect("a path");
+        fs::create_dir_all(words.parent().expect("a directory")).unwrap();
+        fs::write(&words, "teh\n").unwrap();
+
+        let mut checker = config.checker(Some(&words));
+
+        assert!(checker.check("teh cat").is_empty());
+        assert_eq!(checker.check("hte cat").len(), 1, "any other misspelling");
+
+        fs::remove_file(&words).unwrap();
+    }
+
+    /// A config directory of this test's own, so a word list left behind by
+    /// another test is not the one being read.
+    fn temporary() -> OsString {
+        std::env::temp_dir()
+            .join(format!("blackjack-list-{}", std::process::id()))
+            .into_os_string()
+    }
+
     #[test]
     fn the_configured_checker_watches_only_the_classes_it_was_given() {
-        let mut every_class = Config::default().checker();
+        let mut every_class = Config::default().checker(None);
 
         assert_eq!(every_class.check("teh cat").len(), 1);
         assert_eq!(every_class.check("its a test").len(), 1);
@@ -298,7 +385,7 @@ mod tests {
             grammar: Vec::new(),
             ..Config::default()
         }
-        .checker();
+        .checker(None);
 
         assert_eq!(spelling_only.check("teh cat").len(), 1);
         assert!(spelling_only.check("its a test").is_empty());
