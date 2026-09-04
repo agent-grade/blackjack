@@ -345,6 +345,105 @@ mod tests {
             .expect("type");
     }
 
+    /// A session that never ends: both captures replayed through the whole
+    /// stack — screen, input model, real dictionary, painter — thousands of
+    /// frames deep. What is being watched for is anything that accumulates,
+    /// and the signal for that is memory: a structure appended to once a frame
+    /// and never read costs no time at all, so a clock would never see it.
+    /// Time is checked too, warm against warm — the first pass of anything is
+    /// slower than the rest and comparing to it would flatter any result.
+    #[test]
+    fn a_session_thousands_of_frames_long_neither_grows_nor_slows() {
+        const CAPTURES: [&[u8]; 2] = [
+            include_bytes!("../tests/fixtures/claude-tui-40x100.bin"),
+            include_bytes!("../tests/fixtures/claude-wrap-40x100.bin"),
+        ];
+        let input = shared_input();
+        let checker = Box::new(crate::harper::HarperChecker::new(&[], None));
+        let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
+        let mut out = Tap::new(
+            Vec::new(),
+            screen,
+            input,
+            Painter::checking(checker),
+            Log(None),
+        );
+
+        // One frame per write, which is what the tap sees from a pty: handing
+        // it a whole capture at once would close one frame and skip the other
+        // seventeen, and the per-frame work is the point.
+        let frames: Vec<&[u8]> = CAPTURES
+            .iter()
+            .flat_map(|capture| frames_of(capture))
+            .collect();
+        let pass = |out: &mut Tap<Vec<u8>>, passes: usize| {
+            let started = std::time::Instant::now();
+            for _ in 0..passes {
+                for frame in &frames {
+                    out.write_all(frame).expect("replay");
+                    out.out.clear();
+                }
+            }
+            started.elapsed() / passes as u32
+        };
+
+        pass(&mut out, 30);
+        let (warm, settled) = (pass(&mut out, 30), resident());
+        pass(&mut out, 240);
+        let (late, held) = (pass(&mut out, 30), resident());
+
+        // The one queue in this path that nothing here drains — the input tap
+        // takes them, and there is no input tap in a replay. A frame that left
+        // something in it would fill it for the length of a session, and it is
+        // small enough per frame that resident memory would not notice.
+        assert!(
+            out.input.lock().expect("input").take_events().is_empty(),
+            "a frame left something in the event queue"
+        );
+        let grown = held.saturating_sub(settled);
+        // Measured drift over this run is tens of kilobytes. The bar catches
+        // gross accumulation — the kind a day-long session would feel — and
+        // not a slow trickle, which hides in an allocator already holding the
+        // dictionary; that is what the queue assertion above is for.
+        assert!(
+            grown < 512 * 1024,
+            "{grown} bytes more resident after 8000 frames"
+        );
+        assert!(
+            late < warm * 3,
+            "a pass costs {late:?} after 8000 frames against {warm:?} warm"
+        );
+    }
+
+    /// The capture cut where the program ends each frame, so a replay arrives
+    /// the way the program sent it rather than in one piece.
+    fn frames_of(capture: &'static [u8]) -> Vec<&'static [u8]> {
+        const CLOSE: &[u8] = b"\x1b[?2026l";
+        let mut frames = Vec::new();
+        let mut rest = capture;
+        while let Some(at) = rest.windows(CLOSE.len()).position(|window| window == CLOSE) {
+            let (frame, after) = rest.split_at(at + CLOSE.len());
+            frames.push(frame);
+            rest = after;
+        }
+        frames
+    }
+
+    /// This process's resident memory. Other tests run beside this one, so it
+    /// is only worth reading as a difference across a run long enough to
+    /// dwarf them.
+    fn resident() -> usize {
+        let reported = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&reported.stdout)
+            .trim()
+            .parse::<usize>()
+            .expect("a resident size")
+            * 1024
+    }
+
     /// A real session at 40x100: 115 characters typed into the box, which wraps
     /// them onto a second row, then shift+enter and one more word.
     fn wrap_frames(from: usize, to: usize) -> &'static [u8] {

@@ -58,12 +58,24 @@ impl Input {
         while !rest.is_empty() {
             if self.held_escape {
                 self.held_escape = false;
-                if rest[0] as char == DEL {
-                    self.buffer.apply(Key::KillWord);
-                    rest = &rest[1..];
-                } else {
-                    self.parser.advance(&mut self.buffer, &[ESC]);
+                match rest[0] as char {
+                    DEL => self.buffer.apply(Key::KillWord),
+                    // Alt+Enter as a terminal without the kitty protocol sends
+                    // it, and the same line break that protocol spells out.
+                    // Escape then Enter, typed as two keys, is the same two
+                    // bytes and cannot be told apart without a clock — read as
+                    // a break it is corrected by the next frame, where the box
+                    // shows the line it really has. Letting the escape reach
+                    // the parser instead, which is what happened before, was
+                    // wrong for both: it submitted on the carriage return and
+                    // then ate the byte after it as the escape's own final.
+                    '\r' => self.buffer.apply(Key::Break),
+                    _ => {
+                        self.parser.advance(&mut self.buffer, &[ESC]);
+                        continue;
+                    }
                 }
+                rest = &rest[1..];
                 continue;
             }
             let Some(at) = rest.iter().position(|&byte| byte == ESC) else {
@@ -379,6 +391,10 @@ impl Perform for Buffer {
                 self.after_return = true;
             }
             0x0a if self.from_a_pipe && !after_return => self.submit(),
+            // What ends piped input: the first of the two flushes a line the
+            // last newline never closed, and the wrapped program does receive
+            // it, so the account of what was sent has to carry it too.
+            0x04 if self.from_a_pipe && !self.text.is_empty() => self.submit(),
             _ => {
                 if let Some(key) = control_key(byte) {
                     self.apply(key);
@@ -634,6 +650,32 @@ mod tests {
         assert_eq!(input.line(), "world");
     }
 
+    /// On a terminal the same byte is the user pressing ctrl-D, which is the
+    /// wrapped program's business and not a line being sent. Only the wrapper's
+    /// own end-of-input, written for piped stdin, means a line was flushed.
+    #[test]
+    fn a_typed_end_of_input_submits_nothing() {
+        let mut input = piped(false, &[b"one", &[0x04]]);
+
+        assert!(input.take_events().is_empty());
+        assert_eq!(input.line(), "one");
+    }
+
+    /// A piped input whose last line has no newline still reaches the wrapped
+    /// program — the wrapper flushes it with an end-of-input byte, which is
+    /// what a terminal does for a half-typed line. The account of what was sent
+    /// has to carry that line too, or it is short by exactly the one the user
+    /// is most likely to care about.
+    #[test]
+    fn the_last_piped_line_is_submitted_though_no_newline_closed_it() {
+        let mut input = piped(true, &[b"one\ntwo", &[0x04, 0x04]]);
+
+        assert_eq!(
+            input.take_events(),
+            [submit("one", false), submit("two", false)]
+        );
+    }
+
     /// A pipe has no Enter key, and nothing else would ever submit its lines.
     #[test]
     fn a_line_feed_submits_a_piped_line() {
@@ -873,6 +915,17 @@ mod tests {
         assert_eq!(input.cursor(), 0);
         input.feed(b"\x1b[1;3C");
         assert_eq!(input.cursor(), 3);
+    }
+
+    /// Alt+Enter on a terminal that does not speak the kitty protocol arrives as
+    /// `ESC CR`, and it is the same line break. Read as an escape sequence it
+    /// was two faults at once: the carriage return submitted, and the byte
+    /// after it was eaten as the sequence's final.
+    #[test]
+    fn a_legacy_alt_enter_breaks_the_line_and_keeps_what_follows() {
+        let mut input = piped(false, &[b"ab\x1b\rcd\r"]);
+
+        assert_eq!(input.take_events(), [submit("ab\ncd", false)]);
     }
 
     /// Alt+Backspace is `ESC DEL`, and the parser reads a DEL inside a sequence

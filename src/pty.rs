@@ -73,6 +73,7 @@ pub fn run(command: &Command) -> Result<u32> {
     // otherwise hit the default disposition and leave the terminal raw.
     watch_signals(Arc::clone(&master), Arc::clone(&screen)).context("watching for signals")?;
     let _raw = RawMode::enable();
+    restore_terminal_on_panic();
 
     // Detached: this read blocks, and the child exiting must not wait on a keystroke.
     let typed = log.clone();
@@ -101,8 +102,11 @@ pub fn run(command: &Command) -> Result<u32> {
     // The read moves to its own thread so that this one can wait on a timer as
     // well as on the program: the underline is due a pause after the user
     // stops typing, and a program that has finished drawing sends nothing to
-    // wake anyone with.
-    let (chunks, arriving_output) = std::sync::mpsc::channel();
+    // wake anyone with. The handover is bounded, which is what a single loop
+    // gave for free — a program that writes faster than this side can parse
+    // has to wait for it, rather than filling memory with output the terminal
+    // has not been shown yet.
+    let (chunks, arriving_output) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut buf = [0u8; BUF_LEN];
         while let Ok(read) = from_child.read(&mut buf) {
@@ -111,7 +115,12 @@ pub fn run(command: &Command) -> Result<u32> {
             }
         }
     });
-    forward(&arriving_output, &mut tap);
+    if let Ended::TerminalGone = forward(arriving_output, &mut tap) {
+        // Nothing can be shown to anyone any more, so the wrapped program has
+        // nobody left to talk to. Waiting on it instead would wait forever:
+        // it fills the pty nothing is draining and blocks there.
+        let _ = child.kill();
+    }
     tap.log_final_grid();
 
     let status = child.wait().context("waiting for the wrapped command");
@@ -189,11 +198,24 @@ fn checker_thread(wanted: bool) -> (Duration, Receiver<Box<dyn Checker + Send>>)
     (pause, arriving)
 }
 
+/// How the output side stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The wrapped program's output ran out, which is how a session ends.
+    ProgramDone,
+    /// The terminal being written to is gone.
+    TerminalGone,
+}
+
 /// The wrapped program's output on one side and the painter's own clock on the
 /// other. A chunk is written straight through; a timeout is the painter saying
 /// its line has held still long enough to be worth checking, which is the only
 /// thing that ever happens on a screen nobody is drawing to.
-fn forward<W: Write>(chunks: &Receiver<Vec<u8>>, tap: &mut Tap<W>) {
+///
+/// Takes the receiving end rather than borrowing it, so that giving up here
+/// closes the channel: the reader thread is holding a chunk this side will
+/// never take, and a bounded channel would leave it blocked there forever.
+fn forward<W: Write>(chunks: Receiver<Vec<u8>>, tap: &mut Tap<W>) -> Ended {
     loop {
         let arriving = match tap.wake_in() {
             Some(waiting) => chunks.recv_timeout(waiting),
@@ -202,11 +224,12 @@ fn forward<W: Write>(chunks: &Receiver<Vec<u8>>, tap: &mut Tap<W>) {
         match arriving {
             Ok(chunk) => {
                 if tap.write_all(&chunk).is_err() || tap.flush().is_err() {
-                    return;
+                    return Ended::TerminalGone;
                 }
+                panic_if_asked();
             }
             Err(RecvTimeoutError::Timeout) => tap.tick(),
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => return Ended::ProgramDone,
         }
     }
 }
@@ -246,6 +269,37 @@ fn pty_size(reported: Option<(u16, u16)>) -> PtySize {
     }
 }
 
+/// A panic prints its message before unwinding reaches any destructor, so on
+/// the way out the message would land on a terminal still in raw mode: no
+/// newline translation, every line starting where the last one ended. The
+/// restore is idempotent, so the destructor still runs and still does nothing
+/// twice. Deliberately for any thread's panic, not only the one that ends the
+/// session: a panic anywhere in here means the wrapper is no longer keeping
+/// its side of the bargain, and a cooked terminal is the safe way to be wrong.
+fn restore_terminal_on_panic() {
+    let printing = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panicking| {
+        restore_terminal();
+        printing(panicking);
+    }));
+}
+
+/// Nothing outside this process can make the output side panic, so a debug
+/// build takes one on request and the pty test can watch what it leaves
+/// behind. A release build carries no such branch.
+#[cfg(debug_assertions)]
+fn panic_if_asked() {
+    // Read once for the process: this runs on every chunk the program writes.
+    static ASKED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("BLACKJACK_PANIC").is_some());
+    if *ASKED {
+        panic!("asked for a panic on the output thread");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn panic_if_asked() {}
+
 /// Raw mode for as long as the wrapped command runs — the child's own terminal
 /// handling is the only one that should see the keystrokes. Off outside a tty,
 /// which is what makes `blackjack -- echo hi` work in a pipeline.
@@ -278,10 +332,44 @@ fn restore_terminal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screen::Screen;
 
     /// Off is off: nothing is spawned, so nothing can arrive — a channel with
     /// no sender left is the only shape that says the dictionary was never
     /// built rather than merely not ready yet.
+    /// The terminal this was writing to is gone. Whoever is reading the
+    /// wrapped program has a chunk in hand that will never be taken, and the
+    /// handover holds one at a time — so giving up here has to take the
+    /// channel down too, or that reader waits forever and the wrapped program
+    /// waits behind it.
+    #[test]
+    fn a_terminal_that_is_gone_releases_whoever_is_reading() {
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (chunks, arriving) = std::sync::mpsc::sync_channel(1);
+        chunks.send(b"anything".to_vec()).expect("one chunk queued");
+        let mut tap = Tap::new(
+            Gone,
+            Arc::new(Mutex::new(Screen::new(20, 3))),
+            Arc::new(Mutex::new(Input::new(false))),
+            Painter::off(),
+            crate::tap::Log::open(),
+        );
+
+        assert_eq!(forward(arriving, &mut tap), Ended::TerminalGone);
+        assert!(
+            chunks.send(b"more".to_vec()).is_err(),
+            "the reader is still waiting to hand over a chunk"
+        );
+    }
+
     #[test]
     fn the_switch_builds_no_checker_at_all() {
         let (pause, arriving) = checker_thread(false);
