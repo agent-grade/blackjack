@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::input::{Event, SharedInput};
 use crate::painter::Painter;
 use crate::parser::Parser;
+use crate::picker::Picker;
 use crate::screen::{Line, Look, SharedScreen};
 
 const LOG_VAR: &str = "BLACKJACK_DEBUG_LOG";
@@ -200,17 +201,59 @@ impl<W: Write> Write for Tap<W> {
 pub struct InputTap<W: Write> {
     to: W,
     input: SharedInput,
+    picker: Picker,
     log: Log,
 }
 
 impl<W: Write> InputTap<W> {
-    pub fn new(to: W, input: SharedInput, log: Log) -> Self {
-        Self { to, input, log }
+    pub fn new(to: W, input: SharedInput, picker: Picker, log: Log) -> Self {
+        Self {
+            to,
+            input,
+            picker,
+            log,
+        }
+    }
+
+    /// The chord, answered. A press of it stands for the keystrokes that turn
+    /// the flagged word under the cursor into a suggestion, and those go to the
+    /// wrapped program instead of it — the program is never told about a key it
+    /// does not have a meaning for, and gets only keystrokes it does.
+    /// Everything else passes, and ends whatever cycle was running.
+    fn instead_of(&mut self, keys: &[u8]) -> Option<Vec<u8>> {
+        if !self.picker.is_chord(keys) {
+            self.picker.interrupted();
+            return None;
+        }
+        let (line, cursor) = {
+            let input = self.input.lock().ok()?;
+            (input.line().to_string(), input.cursor())
+        };
+        self.picker.fix(&line, cursor)
     }
 }
 
 impl<W: Write> Write for InputTap<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(fix) = self.instead_of(buf) {
+            self.to.write_all(&fix)?;
+            self.to.flush()?;
+            if let Ok(mut input) = self.input.lock() {
+                // The same bytes through the same door: the model reads them as
+                // the keystrokes they are, so it and the program agree without
+                // anyone asking the screen.
+                input.feed(&fix);
+                input.take_events();
+            }
+            // Escaping allocates, and this runs per keystroke.
+            if self.log.is_on() {
+                self.log
+                    .line(format_args!("fix {}B \"{}\"", fix.len(), escape(&fix)));
+            }
+            // The chord itself never reached the program, and the caller is
+            // told its keystroke was taken.
+            return Ok(buf.len());
+        }
         let written = self.to.write(buf)?;
         let Ok(mut input) = self.input.lock() else {
             return Ok(written);
@@ -264,8 +307,61 @@ fn escape(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checker::Checker;
+    use crate::checker::{Checker, Edit};
+    use crate::picker::SharedChecked;
     use crate::screen::Screen;
+
+    /// A keystroke tap whose picker has been told what the checker found, with
+    /// the line already in the model — which is where it would be, since the
+    /// user typed it.
+    fn picking(
+        line: &str,
+        flags: Vec<crate::checker::Flag>,
+    ) -> (SharedInput, SharedChecked, InputTap<Vec<u8>>) {
+        let input = shared_input();
+        input.lock().expect("input").feed(line.as_bytes());
+        let checked = SharedChecked::default();
+        publish(&checked, line, flags);
+        let picker = Picker::new(
+            crate::picker::Chord::parse("ctrl+.").expect("a chord"),
+            checked.clone(),
+        );
+        (
+            input.clone(),
+            checked,
+            InputTap::new(Vec::new(), input, picker, Log(None)),
+        )
+    }
+
+    /// What the checker would have said about a line, said for it. On the
+    /// running wrapper this is the painter's doing, a pause after the typing
+    /// stops.
+    fn publish(checked: &SharedChecked, line: &str, flags: Vec<crate::checker::Flag>) {
+        *checked.lock().expect("checked") = crate::picker::Checked {
+            line: line.to_string(),
+            flags,
+        };
+    }
+
+    fn flagging(
+        span: std::ops::Range<usize>,
+        fixes: &[crate::checker::Edit],
+    ) -> Vec<crate::checker::Flag> {
+        vec![crate::checker::Flag {
+            span,
+            message: String::new(),
+            suggestions: fixes.to_vec(),
+        }]
+    }
+
+    /// A picker with nothing to offer: the chord is one nothing sends and no
+    /// checker has spoken, so every keystroke passes through it untouched.
+    fn idle_picker() -> Picker {
+        Picker::new(
+            crate::picker::Chord::parse("ctrl+.").expect("a chord"),
+            crate::picker::SharedChecked::default(),
+        )
+    }
 
     fn shared_input() -> SharedInput {
         Arc::new(Mutex::new(crate::input::Input::new(false)))
@@ -340,7 +436,7 @@ mod tests {
     }
 
     fn typed(input: &SharedInput, keys: &[u8]) {
-        InputTap::new(Vec::new(), input.clone(), Log(None))
+        InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None))
             .write_all(keys)
             .expect("type");
     }
@@ -444,6 +540,105 @@ mod tests {
             * 1024
     }
 
+    /// The wrapped program is never told about a key it has no meaning for. It
+    /// receives the keystrokes that make the fix, and the model follows the
+    /// same bytes through the same door, so the two agree without anyone
+    /// asking the screen.
+    #[test]
+    fn the_chord_reaches_the_program_as_the_keys_that_fix_the_word() {
+        let (input, _checked, mut keys) =
+            picking("a teh", flagging(2..5, &[Edit::Replace("the".into())]));
+
+        keys.write_all(b"\x1b[46;5u").expect("the chord");
+
+        assert_eq!(keys.to, b"\x7f\x7f\x7fthe");
+        assert_eq!(input.lock().expect("input").line(), "a the");
+    }
+
+    /// With nothing flagged under the cursor the key is the user's, and an
+    /// unused one costs them nothing: it arrives exactly as it was pressed.
+    #[test]
+    fn a_chord_with_nothing_to_fix_goes_through_untouched() {
+        let (input, _checked, mut keys) =
+            picking("a teh word", flagging(2..5, &[Edit::Replace("the".into())]));
+
+        keys.write_all(b"\x1b[46;5u").expect("the chord");
+
+        assert_eq!(keys.to, b"\x1b[46;5u");
+        assert_eq!(input.lock().expect("input").line(), "a teh word");
+    }
+
+    /// The offers are walked by pressing again, and the line ends where the
+    /// user started if none of them was wanted.
+    #[test]
+    fn pressing_again_walks_the_offers_in_the_line_itself() {
+        let offers = [Edit::Replace("the".into()), Edit::Replace("tea".into())];
+        let (input, _checked, mut keys) = picking("a teh", flagging(2..5, &offers));
+
+        for expected in ["a the", "a tea", "a teh"] {
+            keys.write_all(b"\x1b[46;5u").expect("the chord");
+            assert_eq!(input.lock().expect("input").line(), expected);
+        }
+    }
+
+    /// A keystroke of the user's own between two presses ends the cycle. The
+    /// press after it asks the question again — of the line as it stands now,
+    /// which the checker has since had its say about — instead of handing over
+    /// the next answer to a question nobody is still asking.
+    #[test]
+    fn a_key_between_two_presses_ends_the_cycle() {
+        let offers = [Edit::Replace("the".into()), Edit::Replace("tea".into())];
+        let (input, checked, mut keys) = picking("a teh", flagging(2..5, &offers));
+        keys.write_all(b"\x1b[46;5u").expect("the chord");
+        keys.write_all(b"\x1b[D").expect("left");
+        keys.write_all(b"\x1b[C").expect("right, back where it was");
+        publish(&checked, "a the", flagging(2..5, &offers));
+        keys.to.clear();
+
+        keys.write_all(b"\x1b[46;5u").expect("the chord again");
+
+        assert_eq!(
+            keys.to, b"\x7f\x7f\x7fthe",
+            "the second offer, not the first"
+        );
+        assert_eq!(input.lock().expect("input").line(), "a the");
+    }
+
+    /// The spans are into the line the user typed, not the rows the box drew it
+    /// on. Here the model is told the line by the box itself, across two rows,
+    /// and the wrap between them becomes the space it stood for — so the flag's
+    /// span counts characters of one line and the fix lands on the word.
+    #[test]
+    fn a_word_the_box_wrapped_is_fixed_where_the_line_says_it_is() {
+        let (above, below) = ("one two three four", "five teh");
+        let typed = format!("{above} {below}");
+        let at = typed.chars().count() - 3;
+        // Nothing typed: the line this model holds is the one the frame gives
+        // it, which is the whole point of reading the box across its rows.
+        let (input, checked, mut keys) = picking("", Vec::new());
+        let screen = Arc::new(Mutex::new(Screen::new(20, 4)));
+        let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
+
+        out.write_all(wrapped(above, below, (2, 10)).as_bytes())
+            .expect("draw");
+
+        let held = input.lock().expect("input").line().to_string();
+        assert_eq!(held, typed, "the two rows, joined");
+        publish(
+            &checked,
+            &typed,
+            flagging(at..at + 3, &[Edit::Replace("the".into())]),
+        );
+
+        keys.write_all(b"\x1b[46;5u").expect("the chord");
+
+        assert_eq!(keys.to, b"\x7f\x7f\x7fthe");
+        assert_eq!(
+            input.lock().expect("input").line(),
+            "one two three four five the"
+        );
+    }
+
     /// A real session at 40x100: 115 characters typed into the box, which wraps
     /// them onto a second row, then shift+enter and one more word.
     fn wrap_frames(from: usize, to: usize) -> &'static [u8] {
@@ -474,7 +669,7 @@ mod tests {
     #[test]
     fn a_wrapped_row_is_rejoined_with_the_space_the_box_did_not_draw() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"\x1b[A").expect("recall");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -488,7 +683,7 @@ mod tests {
     #[test]
     fn a_break_the_user_typed_survives_the_frame_that_redraws_it() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(TYPED.as_bytes()).expect("type");
         keys.write_all(b"\x1b[13;2u").expect("shift+enter");
         keys.write_all(b"after\x1b[D").expect("type on");
@@ -508,7 +703,7 @@ mod tests {
     #[test]
     fn a_read_ending_mid_redraw_is_answered_by_the_last_whole_frame() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"\x1b[A").expect("recall");
         let screen = Arc::new(Mutex::new(Screen::new(100, 40)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -525,7 +720,7 @@ mod tests {
     #[test]
     fn a_frame_without_a_box_still_answers_the_keystrokes_before_it() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"hi").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -727,7 +922,7 @@ mod tests {
     #[test]
     fn a_frame_corrects_a_line_the_input_model_could_only_record() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"hi\x1b[A").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -744,7 +939,7 @@ mod tests {
     #[test]
     fn a_frame_that_agrees_leaves_the_line_alone() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"hi\x1b[D").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -761,7 +956,7 @@ mod tests {
     #[test]
     fn a_frame_older_than_the_keystrokes_does_not_take_the_line_back() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"ab").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -777,7 +972,7 @@ mod tests {
     #[test]
     fn a_key_that_could_not_be_applied_is_answered_by_an_agreeing_frame_too() {
         let input = shared_input();
-        let mut keys = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut keys = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         keys.write_all(b"hi\x1b[D\x1b[A").expect("type");
         let screen = Arc::new(Mutex::new(Screen::new(20, 3)));
         let mut out = Tap::new(Vec::new(), screen, input.clone(), Painter::off(), Log(None));
@@ -799,7 +994,7 @@ mod tests {
     #[test]
     fn the_input_tap_tracks_a_character_split_across_two_reads() {
         let input = shared_input();
-        let mut tap = InputTap::new(Vec::new(), input.clone(), Log(None));
+        let mut tap = InputTap::new(Vec::new(), input.clone(), idle_picker(), Log(None));
         for read in split_reads() {
             tap.write_all(read).expect("write");
         }

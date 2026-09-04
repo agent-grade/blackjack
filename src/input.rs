@@ -7,9 +7,12 @@ use crate::screen::{Line, param_as_written};
 
 const ESC: u8 = 0x1b;
 const DEL: char = '\u{7f}';
+/// How a terminal numbers the modifiers held with a key. Shared with the
+/// picker, which reads the same numbers out of the user's config.
 const NONE: u16 = 0;
-const ALT: u16 = 0b10;
-const CTRL: u16 = 0b100;
+pub const SHIFT: u16 = 0b1;
+pub const ALT: u16 = 0b10;
+pub const CTRL: u16 = 0b100;
 /// Caps lock and num lock ride in the modifier field beside the keys held down,
 /// so a latched lock would otherwise make every key a combination none of the
 /// tables below name.

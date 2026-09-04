@@ -15,6 +15,7 @@ use crate::cli::Command;
 use crate::config::Config;
 use crate::input::{Input, SharedInput};
 use crate::painter::Painter;
+use crate::picker::{Chord, Picker, SharedChecked};
 use crate::resolve;
 use crate::screen::{Screen, SharedScreen};
 use crate::tap::{InputTap, Log, Tap};
@@ -63,7 +64,9 @@ pub fn run(command: &Command) -> Result<u32> {
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
     let painting = Painter::wanted();
-    let (pause, arriving) = checker_thread(painting);
+    let (pause, chord, arriving) = configured(painting);
+    let checked = SharedChecked::default();
+    let picker = Picker::new(chord, Arc::clone(&checked));
 
     let piped_stdin = !std::io::stdin().is_terminal();
     let input: SharedInput = Arc::new(Mutex::new(Input::new(piped_stdin)));
@@ -80,7 +83,7 @@ pub fn run(command: &Command) -> Result<u32> {
     let typed_input = input.clone();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
-        let mut to_child = InputTap::new(&mut *to_child, typed_input, typed);
+        let mut to_child = InputTap::new(&mut *to_child, typed_input, picker, typed);
         pump(&mut stdin, &mut to_child);
         if piped_stdin {
             // The first EOT flushes a partial line, the second ends the input.
@@ -96,7 +99,7 @@ pub fn run(command: &Command) -> Result<u32> {
         std::io::stdout(),
         screen,
         input,
-        Painter::open(painting, pause, arriving),
+        Painter::open(painting, pause, arriving, Arc::clone(&checked)),
         log,
     );
     // The read moves to its own thread so that this one can wait on a timer as
@@ -180,22 +183,25 @@ fn watch_signals(master: Master, screen: SharedScreen) -> Result<()> {
     Ok(())
 }
 
-/// A third of a second of dictionary loading, kept off the path between the
-/// user and their prompt: the wrapper was started to run a program, so the
+/// Everything the user's config decides, and the checker it asks for on its
+/// way. A third of a second of dictionary loading is kept off the path between
+/// the user and their prompt: the wrapper was started to run a program, so the
 /// checker is built on a thread of its own and joins whenever it is ready.
 /// Switched off, none of it happens — no config is read, no dictionary is
-/// built, and the channel it would have arrived on is closed from the start.
-fn checker_thread(wanted: bool) -> (Duration, Receiver<Box<dyn Checker + Send>>) {
+/// built, and the channel it would have arrived on is closed from the start;
+/// the chord is the default one, which nothing will ask for.
+fn configured(wanted: bool) -> (Duration, Chord, Receiver<Box<dyn Checker + Send>>) {
     if !wanted {
-        return (Duration::ZERO, std::sync::mpsc::channel().1);
+        let quiet = Config::default();
+        return (Duration::ZERO, quiet.chord(), std::sync::mpsc::channel().1);
     }
     let config = Config::load();
-    let pause = config.pause();
+    let (pause, chord) = (config.pause(), config.chord());
     let (built, arriving) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = built.send(config.checker());
     });
-    (pause, arriving)
+    (pause, chord, arriving)
 }
 
 /// How the output side stopped.
@@ -286,7 +292,10 @@ fn restore_terminal_on_panic() {
 
 /// Nothing outside this process can make the output side panic, so a debug
 /// build takes one on request and the pty test can watch what it leaves
-/// behind. A release build carries no such branch.
+/// behind — and only from outside is there anything to watch, since what is
+/// under test is a real terminal coming back cooked before the message lands.
+/// The cost is what settles it: one branch on a value read once for the
+/// process, and nothing at all in a release build.
 #[cfg(debug_assertions)]
 fn panic_if_asked() {
     // Read once for the process: this runs on every chunk the program writes.
@@ -372,7 +381,7 @@ mod tests {
 
     #[test]
     fn the_switch_builds_no_checker_at_all() {
-        let (pause, arriving) = checker_thread(false);
+        let (pause, _, arriving) = configured(false);
 
         assert_eq!(pause, Duration::ZERO);
         assert!(matches!(

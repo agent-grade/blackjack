@@ -11,7 +11,8 @@ blackjack -- claude
 Everything runs locally: the checker is linked in-process, and nothing typed
 ever leaves the machine.
 
-Status: early. v1 is paint-only — blackjack never rewrites your input.
+Status: early. Blackjack changes what you typed only when you ask it to, with
+the fix key below.
 
 ## Configuration
 
@@ -29,6 +30,11 @@ grammar = ["articles", "its-its", "lets-lets"]
 
 # How long typing has to pause before the line is checked and painted.
 pause_ms = 400
+
+# The key that replaces the flagged word under the cursor with the first
+# suggestion. Press it again for the next one, and once more past the last to
+# get your own word back. Modifiers joined by `+`, then the character.
+fix_key = "ctrl+."
 ```
 
 ## Acknowledgements

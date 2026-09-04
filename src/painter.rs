@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 use crate::checker::{Checker, Flag};
+use crate::picker::SharedChecked;
 use crate::screen::{Line, Look};
 
 const PAINT_OFF: &str = "BLACKJACK_PAINT_OFF";
@@ -28,6 +29,9 @@ pub struct Painter {
     line: String,
     changed: Instant,
     flags: Option<Vec<Flag>>,
+    /// What the checker said, left where the keystroke side can read it: the
+    /// picker runs there and the checking runs here.
+    checked: SharedChecked,
 }
 
 impl Painter {
@@ -39,7 +43,12 @@ impl Painter {
         std::env::var_os(PAINT_OFF).is_none()
     }
 
-    pub fn open(on: bool, pause: Duration, arriving: Receiver<Box<dyn Checker + Send>>) -> Self {
+    pub fn open(
+        on: bool,
+        pause: Duration,
+        arriving: Receiver<Box<dyn Checker + Send>>,
+        checked: SharedChecked,
+    ) -> Self {
         Self {
             on,
             pause,
@@ -48,6 +57,7 @@ impl Painter {
             line: String::new(),
             changed: Instant::now(),
             flags: None,
+            checked,
         }
     }
 
@@ -83,12 +93,10 @@ impl Painter {
             if self.changed.elapsed() < self.pause {
                 return None;
             }
-            self.flags = Some(self.checker.as_mut()?.check(&line.text));
+            let flags = self.checker.as_mut()?.check(&line.text);
+            self.publish(&line.text, &flags);
+            self.flags = Some(flags);
         }
-        // Every frame, not only the one that found them: the box redraws for
-        // its own reasons — a cursor blink, a notice, the next keystroke — and
-        // each redraw wipes what was painted over it. The flags are cached with
-        // the text they were found in, so this costs no dictionary.
         let runs: Vec<_> = self
             .flags
             .iter()
@@ -112,6 +120,16 @@ impl Painter {
             return None;
         }
         Some(draw(&runs, look))
+    }
+
+    /// The answer, and the line it is about, for whoever is watching the
+    /// keystrokes. A flag is a span into a particular line and means nothing
+    /// against another, so the two travel together.
+    fn publish(&self, line: &str, flags: &[Flag]) {
+        if let Ok(mut checked) = self.checked.lock() {
+            checked.line = line.to_string();
+            checked.flags = flags.to_vec();
+        }
     }
 
     /// How long the output side may wait on the wrapped program before this
@@ -212,13 +230,23 @@ impl Painter {
     pub fn checking(checker: Box<dyn Checker + Send>) -> Self {
         Self {
             checker: Some(checker),
-            ..Self::open(true, Duration::ZERO, std::sync::mpsc::channel().1)
+            ..Self::open(
+                true,
+                Duration::ZERO,
+                std::sync::mpsc::channel().1,
+                SharedChecked::default(),
+            )
         }
     }
 
     /// A painter that draws nothing, however it is asked.
     pub fn off() -> Self {
-        Self::open(false, Duration::ZERO, std::sync::mpsc::channel().1)
+        Self::open(
+            false,
+            Duration::ZERO,
+            std::sync::mpsc::channel().1,
+            SharedChecked::default(),
+        )
     }
 }
 
@@ -259,7 +287,6 @@ mod tests {
             self.1.fetch_add(1, Ordering::Relaxed);
             vec![Flag {
                 span: self.0.clone(),
-                kind: crate::checker::Kind::Spelling,
                 message: String::new(),
                 suggestions: Vec::new(),
             }]
@@ -347,7 +374,7 @@ mod tests {
     #[test]
     fn nothing_is_painted_before_the_checker_arrives() {
         let (built, arriving) = std::sync::mpsc::channel();
-        let mut painter = Painter::open(true, Duration::ZERO, arriving);
+        let mut painter = Painter::open(true, Duration::ZERO, arriving, SharedChecked::default());
         let drawn = box_holding("a teh word");
         assert!(
             ask(&mut painter, &drawn).is_none(),

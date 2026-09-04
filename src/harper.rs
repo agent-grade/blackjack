@@ -7,7 +7,7 @@ use harper_core::linting::{LintGroup, Suggestion};
 use harper_core::spell::{FstDictionary, MergedDictionary, MutableDictionary};
 use harper_core::{Dialect, DictWordMetadata, Document};
 
-use crate::checker::{Checker, Flag, Kind};
+use crate::checker::{Checker, Edit, Flag};
 
 /// The curated grammar classes and the harper rules each one turns on. Harper
 /// ships some seven hundred rules; everything outside this table stays off, so
@@ -61,13 +61,12 @@ impl Checker for HarperChecker {
             .rules
             .organized_lints(&document)
             .into_iter()
-            .filter_map(|(rule, lints)| kind_of(&rule).map(|kind| (kind, lints)))
-            .flat_map(|(kind, lints)| {
-                lints.into_iter().map(move |lint| Flag {
+            .filter(|(rule, _)| is_curated(rule))
+            .flat_map(|(_, lints)| {
+                lints.into_iter().map(|lint| Flag {
                     span: lint.span.start..lint.span.end,
-                    kind,
                     message: lint.message,
-                    suggestions: lint.suggestions.iter().filter_map(replacement).collect(),
+                    suggestions: lint.suggestions.iter().map(edit_of).collect(),
                 })
             })
             .collect();
@@ -77,26 +76,25 @@ impl Checker for HarperChecker {
     }
 }
 
-/// Which class a harper rule reports under. A rule this table does not name is
-/// dropped rather than shown, so a harper release that turns something on by
-/// itself cannot start underlining words the user never asked about.
-fn kind_of(rule: &str) -> Option<Kind> {
-    if rule == SPELL_CHECK {
-        return Some(Kind::Spelling);
-    }
-    CLASSES
-        .iter()
-        .find(|(_, class_rules)| class_rules.contains(&rule))
-        .map(|(class, _)| Kind::Grammar(class))
+/// Whether a rule is one this wrapper speaks about at all: spelling, or a rule
+/// in one of the curated classes. A rule this table does not name is dropped
+/// rather than shown, so a harper release that turns something on by itself
+/// cannot start underlining words the user never asked about.
+fn is_curated(rule: &str) -> bool {
+    rule == SPELL_CHECK
+        || CLASSES
+            .iter()
+            .any(|(_, class_rules)| class_rules.contains(&rule))
 }
 
-/// Only a straight replacement survives: it is the one suggestion shape that
-/// means anything as a bare word. Insertions and deletions need the span beside
-/// them to read, and nothing displays suggestions until the picker lands.
-fn replacement(suggestion: &Suggestion) -> Option<String> {
+/// All three shapes a suggestion comes in. Read as a bare word an insertion or
+/// a deletion means nothing, so each says what it does to the flagged stretch
+/// and the picker does it.
+fn edit_of(suggestion: &Suggestion) -> Edit {
     match suggestion {
-        Suggestion::ReplaceWith(characters) => Some(characters.iter().collect()),
-        Suggestion::InsertAfter(_) | Suggestion::Remove => None,
+        Suggestion::ReplaceWith(characters) => Edit::Replace(characters.iter().collect()),
+        Suggestion::InsertAfter(characters) => Edit::InsertAfter(characters.iter().collect()),
+        Suggestion::Remove => Edit::Remove,
     }
 }
 
@@ -154,15 +152,31 @@ mod tests {
         path
     }
 
+    /// Every shape a suggestion comes in says what it does to the flagged
+    /// stretch. The curated rules only ever ask for a replacement today, so
+    /// nothing else here can reach the other two — they are the engine's
+    /// vocabulary, not this table's guess at it.
+    #[test]
+    fn every_shape_of_suggestion_says_what_it_does() {
+        assert_eq!(
+            edit_of(&Suggestion::ReplaceWith("the".chars().collect())),
+            Edit::Replace("the".into())
+        );
+        assert_eq!(
+            edit_of(&Suggestion::InsertAfter("'s".chars().collect())),
+            Edit::InsertAfter("'s".into())
+        );
+        assert_eq!(edit_of(&Suggestion::Remove), Edit::Remove);
+    }
+
     #[test]
     fn a_misspelling_is_flagged_with_the_word_that_was_meant() {
         let flags = checker().check("teh cat sat");
 
         assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, Kind::Spelling);
         assert_eq!(flags[0].span, 0..3);
         assert!(
-            flags[0].suggestions.iter().any(|word| word == "the"),
+            flags[0].suggestions.contains(&Edit::Replace("the".into())),
             "{:?}",
             flags[0].suggestions
         );
@@ -173,8 +187,8 @@ mod tests {
         let flags = checker().check("its a test");
 
         assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, Kind::Grammar("its-its"));
         assert_eq!(flags[0].span, 0..3);
+        assert!(flags[0].suggestions.contains(&Edit::Replace("it's".into())));
     }
 
     #[test]
@@ -182,8 +196,7 @@ mod tests {
         let flags = checker().check("This is an mule.");
 
         assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, Kind::Grammar("articles"));
-        assert!(flags[0].suggestions.iter().any(|word| word == "a"));
+        assert!(flags[0].suggestions.contains(&Edit::Replace("a".into())));
     }
 
     #[test]
@@ -191,7 +204,13 @@ mod tests {
         let flags = checker().check("Lets try that again.");
 
         assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, Kind::Grammar("lets-lets"));
+        assert!(
+            flags[0]
+                .suggestions
+                .contains(&Edit::Replace("Let's".into())),
+            "{:?}",
+            flags[0].suggestions
+        );
     }
 
     #[test]

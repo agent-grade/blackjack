@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::checker::Checker;
 use crate::harper::HarperChecker;
+use crate::picker::Chord;
 
 const DIRECTORY: &str = "blackjack";
 const FILE: &str = "config.toml";
@@ -25,6 +26,9 @@ pub struct Config {
     pub grammar: Vec<String>,
     /// How long the typing has to stop before the line is checked.
     pub pause_ms: u64,
+    /// The key that fixes the flagged word under the cursor: the modifiers
+    /// held down, joined by `+`, and then the character.
+    pub fix_key: String,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
                 .map(|class| (*class).to_string())
                 .collect(),
             pause_ms: 400,
+            fix_key: "ctrl+.".to_string(),
         }
     }
 }
@@ -56,6 +61,15 @@ impl Config {
 
     pub fn pause(&self) -> Duration {
         Duration::from_millis(self.pause_ms)
+    }
+
+    /// The fix key, or the default one when what is written is not a chord.
+    /// Same as everything else here: a line the user got wrong costs them that
+    /// line's setting and nothing more.
+    pub fn chord(&self) -> Chord {
+        Chord::parse(&self.fix_key)
+            .or_else(|| Chord::parse(&Self::default().fix_key))
+            .expect("the default chord parses")
     }
 
     /// The configured engine. The wrapper asks for a checker and never learns
@@ -154,7 +168,7 @@ mod tests {
     fn a_config_the_user_wrote_is_read_whole() {
         let path = config_file(
             "whole",
-            "dict_path = \"/words.txt\"\ngrammar = [\"articles\"]\npause_ms = 120\n",
+            "dict_path = \"/words.txt\"\ngrammar = [\"articles\"]\npause_ms = 120\nfix_key = \"alt+f\"\n",
         );
 
         let config = Config::read(&path, home());
@@ -162,6 +176,20 @@ mod tests {
         assert_eq!(config.dict_path, Some(PathBuf::from("/words.txt")));
         assert_eq!(config.grammar, ["articles"]);
         assert_eq!(config.pause(), Duration::from_millis(120));
+        assert_eq!(config.chord(), Chord::parse("alt+f").expect("a chord"));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// A chord nobody can press is a line of the config got wrong, and it costs
+    /// that line: the default key still works rather than none at all.
+    #[test]
+    fn a_fix_key_that_is_not_a_chord_keeps_the_default_one() {
+        let path = config_file("chord", "fix_key = \"hyper+x\"\n");
+
+        let config = Config::read(&path, home());
+
+        assert_eq!(config.chord(), Config::default().chord());
 
         fs::remove_file(&path).unwrap();
     }

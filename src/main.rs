@@ -5,6 +5,7 @@ mod harper;
 mod input;
 mod painter;
 mod parser;
+mod picker;
 mod pty;
 mod resolve;
 mod screen;

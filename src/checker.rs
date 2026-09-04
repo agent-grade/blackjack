@@ -2,13 +2,15 @@
 
 use std::ops::Range;
 
-/// What a flag is about. `Grammar` carries the curated class that raised it, so
-/// a painter can style an article slip differently from a misspelling and a
-/// later picker can say which rule spoke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Spelling,
-    Grammar(&'static str),
+/// What accepting a suggestion does to the flagged stretch of the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    /// The stretch becomes this.
+    Replace(String),
+    /// This goes in after the stretch, which stays as it is.
+    InsertAfter(String),
+    /// The stretch goes, and the space beside it goes with it.
+    Remove,
 }
 
 /// One stretch of the line worth underlining. `span` counts **characters**, not
@@ -17,9 +19,8 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
     pub span: Range<usize>,
-    pub kind: Kind,
     pub message: String,
-    pub suggestions: Vec<String>,
+    pub suggestions: Vec<Edit>,
 }
 
 /// Everything the wrapper knows about a checking engine. Harper is the first
@@ -33,23 +34,21 @@ pub trait Checker {
 #[cfg(test)]
 pub struct FakeChecker {
     flagged: Vec<String>,
-    kind: Kind,
+    fixes: Vec<Edit>,
 }
 
 #[cfg(test)]
 impl FakeChecker {
+    /// Flags the words it was given and offers nothing to do about them.
     pub fn spelling(flagged: &[&str]) -> Self {
-        Self::new(flagged, Kind::Spelling)
+        Self::fixing(flagged, &[])
     }
 
-    pub fn grammar(class: &'static str, flagged: &[&str]) -> Self {
-        Self::new(flagged, Kind::Grammar(class))
-    }
-
-    fn new(flagged: &[&str], kind: Kind) -> Self {
+    /// The same, with a known list of fixes on every word it flags.
+    pub fn fixing(flagged: &[&str], fixes: &[Edit]) -> Self {
         Self {
             flagged: flagged.iter().map(|word| (*word).to_string()).collect(),
-            kind,
+            fixes: fixes.to_vec(),
         }
     }
 }
@@ -62,9 +61,8 @@ impl Checker for FakeChecker {
             .filter(|(_, word)| self.flagged.iter().any(|flagged| flagged == word))
             .map(|(span, word)| Flag {
                 span,
-                kind: self.kind,
                 message: format!("`{word}` is flagged"),
-                suggestions: Vec::new(),
+                suggestions: self.fixes.clone(),
             })
             .collect()
     }
@@ -152,15 +150,5 @@ mod tests {
         assert_eq!(flags[0].span, 0..3);
         assert_eq!(flags[1].span, 5..9);
         assert_eq!(flags[2].span, 10..13);
-    }
-
-    #[test]
-    fn a_grammar_flag_carries_the_class_that_raised_it() {
-        let mut checker = FakeChecker::grammar("its-its", &["its"]);
-
-        let flags = checker.check("its a test");
-
-        assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].kind, Kind::Grammar("its-its"));
     }
 }
