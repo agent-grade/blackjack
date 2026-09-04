@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 use crate::checker::{Checker, Flag};
-use crate::screen::Line;
+use crate::screen::{Line, Look};
 
 const PAINT_OFF: &str = "BLACKJACK_PAINT_OFF";
 
@@ -31,17 +31,17 @@ pub struct Painter {
 }
 
 impl Painter {
-    /// Whether the user wants any of this at all: a paint that ever fights the
+    /// Whether the user wants any of this at all — a paint that fights the
     /// wrapped program for the screen has to be turnable off without a
-    /// rebuild, and off means the dictionary is never built either.
+    /// rebuild. Asked once, before anything is spent on the answer: off means
+    /// no config read, no dictionary built, and nothing drawn.
     pub fn wanted() -> bool {
         std::env::var_os(PAINT_OFF).is_none()
     }
 
-    /// The switch is read once, at the start.
-    pub fn open(pause: Duration, arriving: Receiver<Box<dyn Checker + Send>>) -> Self {
+    pub fn open(on: bool, pause: Duration, arriving: Receiver<Box<dyn Checker + Send>>) -> Self {
         Self {
-            on: Self::wanted(),
+            on,
             pause,
             arriving,
             checker: None,
@@ -57,16 +57,24 @@ impl Painter {
     /// taken back out of it — while its spots are where the box is showing it,
     /// so a word broken across two rows is one word to the checker and two
     /// underlines on the screen.
-    pub fn paint(
-        &mut self,
-        line: Option<&Line>,
-        cursor: (usize, usize),
-        mid_frame: bool,
-    ) -> Option<Vec<u8>> {
-        if !self.on || mid_frame {
+    pub fn paint(&mut self, line: Option<&Line>, look: &Look) -> Option<Vec<u8>> {
+        if !self.on || look.mid_frame {
             return None;
         }
-        let line = line?;
+        let Some(line) = line else {
+            // The box has left the screen — an alternate screen, a dialog, a
+            // program that cleared it. What was cached describes a line that is
+            // nowhere, and keeping it would also leave a pause running out for
+            // a line nothing can paint.
+            self.forget();
+            return None;
+        };
+        // A glyph in the last column leaves the terminal holding a wrap it has
+        // not acted on, and moving the cursor away throws that away: the
+        // program's next character would land on this row rather than the next.
+        if look.wrap_pending {
+            return None;
+        }
         if self.checker.is_none() {
             self.checker = self.arriving.try_recv().ok();
         }
@@ -82,13 +90,24 @@ impl Painter {
             }
             self.flags = Some(self.checker.as_mut()?.check(&line.text));
         }
+        // Every frame, not only the one that found them: the box redraws for
+        // its own reasons — a cursor blink, a notice, the next keystroke — and
+        // each redraw wipes what was painted over it. The flags are cached with
+        // the text they were found in, so this costs no dictionary.
         let runs: Vec<_> = self
             .flags
             .iter()
             .flatten()
             .flat_map(|flag| runs_of(line, &flag.span))
             .collect();
-        (!runs.is_empty()).then(|| draw(&runs, cursor))
+        (!runs.is_empty()).then(|| draw(&runs, look))
+    }
+
+    /// Nothing held about a line: no text to compare the next one against, no
+    /// flags to draw, and nothing for `wake_in` to wait out.
+    fn forget(&mut self) {
+        self.line.clear();
+        self.flags = None;
     }
 
     /// How long the output side may wait on the wrapped program before this
@@ -112,11 +131,18 @@ impl Painter {
 }
 
 /// A flagged stretch of the line as it can actually be drawn: the characters
-/// standing next to each other on one row, at the column the first of them sits
-/// in. The box may have broken the stretch across two rows, and the break
-/// itself has no cell — either ends the run and starts another.
-fn runs_of(line: &Line, span: &Range<usize>) -> Vec<(usize, usize, String)> {
-    let mut runs: Vec<(usize, usize, String)> = Vec::new();
+/// standing next to each other on one row, at the column the first of them
+/// sits in.
+struct Run {
+    row: usize,
+    col: usize,
+    text: String,
+}
+
+/// The box may have broken a flagged stretch across two rows, and the break
+/// itself has no cell — either one ends a run and starts another.
+fn runs_of(line: &Line, span: &Range<usize>) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
     let mut after = None;
     for (at, character) in line
         .text
@@ -131,8 +157,12 @@ fn runs_of(line: &Line, span: &Range<usize>) -> Vec<(usize, usize, String)> {
             continue;
         };
         match runs.last_mut() {
-            Some((.., text)) if after == Some((row, col)) => text.push(character),
-            _ => runs.push((row, col, character.to_string())),
+            Some(run) if after == Some((row, col)) => run.text.push(character),
+            _ => runs.push(Run {
+                row,
+                col,
+                text: character.to_string(),
+            }),
         }
         after = Some((row, col + character.width().unwrap_or(1)));
     }
@@ -143,20 +173,27 @@ fn runs_of(line: &Line, span: &Range<usize>) -> Vec<(usize, usize, String)> {
 /// rather than a cursor jumping about. The cursor is put back by moving it
 /// rather than by `ESC 7`/`ESC 8`: a terminal keeps one saved cursor per screen
 /// and the program uses that slot itself, so saving here would hand the program
-/// this paint's position back as its own. The cost of not using it is that it
-/// would have carried the pen too — so the words are re-printed in whatever
-/// colour the program had set, and the two attributes this does set are turned
-/// off one each because they are two attributes.
-fn draw(runs: &[(usize, usize, String)], cursor: (usize, usize)) -> Vec<u8> {
-    let mut paint = String::from("\x1b[?2026h");
-    for (row, col, text) in runs {
+/// this paint's position back as its own. `ESC 7` would have carried the pen
+/// too, so this clears it before printing — the word comes out as the box drew
+/// it rather than in whatever the program last set — and puts back what the
+/// screen model holds afterwards, which is dim and nothing else. Against the
+/// program this wrapper is for that is a formality: neither capture has a
+/// single frame closing with any attribute set.
+fn draw(runs: &[Run], look: &Look) -> Vec<u8> {
+    let mut paint = String::from("\x1b[?2026h\x1b[0m");
+    for run in runs {
         paint += &format!(
-            "\x1b[{};{}H\x1b[4:3m\x1b[58:2::255:0:0m{text}\x1b[59m\x1b[24m",
-            row + 1,
-            col + 1
+            "\x1b[{};{}H\x1b[4:3m\x1b[58:2::255:0:0m{}\x1b[59m\x1b[24m",
+            run.row + 1,
+            run.col + 1,
+            run.text
         );
     }
-    paint += &format!("\x1b[{};{}H\x1b[?2026l", cursor.0 + 1, cursor.1 + 1);
+    paint += &format!("\x1b[{};{}H", look.cursor.0 + 1, look.cursor.1 + 1);
+    if look.dimmed {
+        paint += "\x1b[2m";
+    }
+    paint += "\x1b[?2026l";
     paint.into_bytes()
 }
 
@@ -165,23 +202,14 @@ impl Painter {
     /// A painter holding a checker already, with no pause to wait out.
     pub fn checking(checker: Box<dyn Checker + Send>) -> Self {
         Self {
-            on: true,
             checker: Some(checker),
-            ..Self::off()
+            ..Self::open(true, Duration::ZERO, std::sync::mpsc::channel().1)
         }
     }
 
     /// A painter that draws nothing, however it is asked.
     pub fn off() -> Self {
-        Self {
-            on: false,
-            pause: Duration::ZERO,
-            arriving: std::sync::mpsc::channel().1,
-            checker: None,
-            line: String::new(),
-            changed: Instant::now(),
-            flags: None,
-        }
+        Self::open(false, Duration::ZERO, std::sync::mpsc::channel().1)
     }
 }
 
@@ -198,11 +226,8 @@ mod tests {
     /// with no input model behind these tests, the screen's own reading of it
     /// stands in for the user's — and where the program left its cursor.
     fn ask(painter: &mut Painter, screen: &Screen) -> Option<Vec<u8>> {
-        painter.paint(
-            screen.frame_line().as_ref(),
-            screen.cursor(),
-            screen.mid_frame(),
-        )
+        let look = screen.look();
+        painter.paint(look.line.as_ref(), &look)
     }
 
     /// A frame of the box, closed — the line is read at the close and nowhere
@@ -256,7 +281,7 @@ mod tests {
         let paint = paint_of(&mut checking(&["teh"]), &box_holding("a teh word"));
         assert_eq!(
             paint.expect("a paint"),
-            "\x1b[?2026h\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[3;4H\x1b[?2026l"
+            "\x1b[?2026h\x1b[0m\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[3;4H\x1b[?2026l"
         );
     }
 
@@ -287,7 +312,10 @@ mod tests {
         let mut redrawing = box_holding("a teh word");
         crate::parser::Parser::new().advance(&mut redrawing, b"\x1b[?2026h");
         assert!(ask(&mut painter, &redrawing).is_none());
-        assert!(ask(&mut painter, &closed).is_some(), "and never again");
+        assert!(
+            ask(&mut painter, &closed).is_some(),
+            "and never again once it closed"
+        );
     }
 
     #[test]
@@ -303,7 +331,7 @@ mod tests {
     #[test]
     fn nothing_is_painted_before_the_checker_arrives() {
         let (built, arriving) = std::sync::mpsc::channel();
-        let mut painter = Painter::open(Duration::ZERO, arriving);
+        let mut painter = Painter::open(true, Duration::ZERO, arriving);
         let drawn = box_holding("a teh word");
         assert!(
             ask(&mut painter, &drawn).is_none(),
@@ -359,15 +387,94 @@ mod tests {
     }
 
     /// The check is what costs — a dictionary lookup — and the box redraws for
-    /// its own reasons. A line that has not changed is not asked about again.
+    /// its own reasons. A line that has not changed is not asked about again,
+    /// and every one of those redraws is painted over again, because each of
+    /// them wiped the underline the one before it carried.
     #[test]
-    fn a_line_that_has_not_changed_is_not_checked_again() {
+    fn every_redraw_of_the_same_line_is_painted_over_again() {
         let (mut painter, asked) = spanning(0..3);
         let drawn = box_holding("a teh word");
-        for _ in 0..4 {
-            ask(&mut painter, &drawn);
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted a changed line"
+        );
+        for redraw in 0..3 {
+            assert!(ask(&mut painter, &drawn).is_some(), "redraw {redraw}");
         }
         assert_eq!(asked.load(Ordering::Relaxed), 1);
+    }
+
+    /// The box is gone — an alternate screen, a dialog, a program that cleared
+    /// it. There is nothing to paint on and nothing the cached flags describe,
+    /// so they go: the same text coming back is a new line, checked again. The
+    /// pause goes with them, or the painter would sit asking to be woken for a
+    /// line that is nowhere.
+    #[test]
+    fn a_box_that_leaves_the_screen_takes_its_flags_with_it() {
+        let (mut painter, asked) = spanning(0..3);
+        let drawn = box_holding("a teh word");
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted a changed line"
+        );
+        assert!(ask(&mut painter, &drawn).is_some());
+
+        let mut gone = Screen::new(20, 3);
+        crate::parser::Parser::new().advance(&mut gone, b"\x1b[?2026h\x1b[2Jbusy\x1b[?2026l");
+        assert!(ask(&mut painter, &gone).is_none(), "painted with no box");
+        assert!(
+            painter.wake_in().is_none(),
+            "still waiting on a line nobody has"
+        );
+
+        assert!(
+            ask(&mut painter, &drawn).is_none(),
+            "painted from a dropped cache"
+        );
+        assert!(ask(&mut painter, &drawn).is_some());
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// A glyph in the last column leaves the terminal holding a wrap it has not
+    /// acted on yet. Moving the cursor away discards it, and the program's next
+    /// character would then land on this row instead of the next one.
+    #[test]
+    fn a_frame_ending_on_a_pending_wrap_is_left_alone() {
+        let mut screen = Screen::new(8, 3);
+        // The last thing drawn is the glyph itself: any cursor move after it
+        // is the terminal committing to the wrap, and then there is none left.
+        let drawn = "\x1b[?2026h\x1b[1;1H\u{2500}\u{2500}\u{2500}\x1b[3;1H\u{2500}\u{2500}\u{2500}\x1b[2;1H\u{276f}\u{a0}abcdef\x1b[?2026l";
+        crate::parser::Parser::new().advance(&mut screen, drawn.as_bytes());
+        assert!(
+            screen.look().wrap_pending,
+            "the box did not fill its last column"
+        );
+        let (mut painter, _) = spanning(0..3);
+
+        assert!(
+            ask(&mut painter, &screen).is_none(),
+            "painted a changed line"
+        );
+        assert!(ask(&mut painter, &screen).is_none());
+    }
+
+    /// The paint prints the word itself, so it clears the pen first or the word
+    /// comes out in whatever the program last set — and puts back what the
+    /// program had, which this model knows as dim and nothing else.
+    #[test]
+    fn the_pen_the_program_left_is_put_back() {
+        let mut screen = box_holding("a teh word");
+        crate::parser::Parser::new().advance(&mut screen, b"\x1b[?2026h\x1b[2m\x1b[?2026l");
+        let mut painter = checking(&["teh"]);
+
+        assert!(
+            ask(&mut painter, &screen).is_none(),
+            "painted a changed line"
+        );
+        let paint = String::from_utf8(ask(&mut painter, &screen).expect("a paint")).expect("utf8");
+
+        assert!(paint.starts_with("\x1b[?2026h\x1b[0m"), "{paint:?}");
+        assert!(paint.ends_with("\x1b[2m\x1b[?2026l"), "{paint:?}");
     }
 
     /// One flag can cover more than one row — a phrase the box wrapped — and is

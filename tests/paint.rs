@@ -7,8 +7,7 @@ const SIZE: (u16, u16) = (40, 100);
 /// The whole paint, not its middle: the box puts `teh` at column 5 of row 2
 /// and leaves the cursor at column 13, so an underline in the wrong place or
 /// one that abandons the program's cursor is a different string.
-const UNDERLINE: &str =
-    "\x1b[?2026h\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;13H\x1b[?2026l";
+const UNDERLINE: &str = "\x1b[?2026h\x1b[0m\x1b[2;5H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;13H\x1b[?2026l";
 /// How long the box sits there untouched after being drawn once. The program
 /// draws nothing more, so nothing but the wrapper's own clock can produce the
 /// underline — and the real engine is still loading its dictionary when the
@@ -29,9 +28,10 @@ const FAKE_BOX: &str = "\\033[?2026h\\033[1;1H\\342\\224\\200\\342\\224\\200\\34
 #[test]
 fn a_misspelling_in_a_box_nobody_redraws_is_still_underlined() {
     let seen = run_wrapped(false);
-    assert!(
-        seen.contains(UNDERLINE),
-        "the underline never landed: {seen:?}"
+    assert_eq!(
+        seen.matches(UNDERLINE).count(),
+        1,
+        "the underline did not land exactly once: {seen:?}"
     );
     assert!(
         seen.find(UNDERLINE) > seen.find("a teh word"),

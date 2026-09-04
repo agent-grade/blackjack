@@ -62,7 +62,8 @@ pub fn run(command: &Command) -> Result<u32> {
     // is an Enter the wrapped program never received, so this writer is never
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
-    let (pause, arriving) = checker_thread(Painter::wanted());
+    let painting = Painter::wanted();
+    let (pause, arriving) = checker_thread(painting);
 
     let piped_stdin = !std::io::stdin().is_terminal();
     let input: SharedInput = Arc::new(Mutex::new(Input::new(piped_stdin)));
@@ -94,7 +95,7 @@ pub fn run(command: &Command) -> Result<u32> {
         std::io::stdout(),
         screen,
         input,
-        Painter::open(pause, arriving),
+        Painter::open(painting, pause, arriving),
         log,
     );
     // The read moves to its own thread so that this one can wait on a timer as

@@ -65,6 +65,18 @@ pub struct Screen {
 /// The line the box is showing: its text, where the cursor sits in it counted
 /// in characters, and where each of those characters is on the grid. A break
 /// the box drew stands for a row ending and has no cell of its own.
+/// One reading of the screen: the line the last frame left, where the program
+/// is holding its cursor, and the three states a paint has to respect — a
+/// frame still open, a wrap the terminal has not committed to, and the pen the
+/// program left set.
+pub struct Look {
+    pub line: Option<Line>,
+    pub cursor: (usize, usize),
+    pub mid_frame: bool,
+    pub wrap_pending: bool,
+    pub dimmed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
     pub text: String,
@@ -149,16 +161,22 @@ impl Screen {
         self.frames
     }
 
-    pub fn mid_frame(&self) -> bool {
-        self.mid_frame
-    }
-
-    /// What `input_row` said at the end of the last frame, which is the only
-    /// moment the box is whole. Its line breaks are the rows the box drew and
-    /// not yet the ones the user typed — only the line being replaced can tell
-    /// those apart, so `Input` is where they are read.
-    pub fn frame_line(&self) -> Option<Line> {
-        self.frame_line.clone()
+    /// Everything the painter needs, read in one go. Taken apart, a resize on
+    /// another thread could answer two of these from two different shapes of
+    /// the screen, and the underline would land on a place neither has.
+    ///
+    /// `line` is what `read_box` said at the end of the last frame, which is
+    /// the only moment the box is whole. Its line breaks are the rows the box
+    /// drew and not yet the ones the user typed — only the line being replaced
+    /// can tell those apart, so `Input` is where they are read.
+    pub fn look(&self) -> Look {
+        Look {
+            line: self.frame_line.clone(),
+            cursor: (self.row, self.col),
+            mid_frame: self.mid_frame,
+            wrap_pending: self.wrap_pending,
+            dimmed: self.dimmed,
+        }
     }
 
     /// The line being typed as the program is showing it, and where in it the
@@ -995,6 +1013,30 @@ mod tests {
     fn the_input_row_is_the_prompt_row_and_the_rows_continuing_it() {
         let screen = boxed(20, 5, &["one", "  two"], "\r\nmode");
         assert_eq!(input_row(&screen), Some(("one\ntwo".into(), 7)));
+    }
+
+    /// Every character of the line carries the cell it was drawn in, which is
+    /// what lets an underline be put back exactly over it. The break between
+    /// two rows is the box's own and stands on no cell at all.
+    #[test]
+    fn every_character_of_the_line_carries_the_cell_it_was_drawn_in() {
+        let line = boxed(20, 5, &["one", "  two"], "\r\nmode")
+            .read_box()
+            .expect("a box");
+
+        assert_eq!(line.text, "one\ntwo");
+        assert_eq!(
+            line.spots,
+            [
+                Some((1, 2)),
+                Some((1, 3)),
+                Some((1, 4)),
+                None,
+                Some((2, 2)),
+                Some((2, 3)),
+                Some((2, 4)),
+            ]
+        );
     }
 
     /// The cursor is a column on the grid and a character index in the line, and

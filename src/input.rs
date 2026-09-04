@@ -561,7 +561,15 @@ mod tests {
     /// the user and their keyboard.
     #[test]
     fn a_modified_enter_breaks_the_line_whichever_modifier_it_was() {
-        for modified in [b"\x1b[13;2u".as_slice(), b"\x1b[13;3u", b"\x1b[13;5u"] {
+        // The last is shift with a caps lock latched: the lock rides in the
+        // same field as the modifiers and is masked off before this table, so
+        // it is still shift, and shift is still a break.
+        for modified in [
+            b"\x1b[13;2u".as_slice(),
+            b"\x1b[13;3u",
+            b"\x1b[13;5u",
+            b"\x1b[13;66u",
+        ] {
             let mut input = Input::new(false);
             input.feed(b"ab");
             input.feed(modified);
@@ -569,6 +577,19 @@ mod tests {
             assert_eq!(input.line(), "ab\ncd");
             assert!(input.take_events().is_empty(), "a break submitted the line");
         }
+    }
+
+    /// A latched lock is not a key the user is holding. Caps lock alone rides
+    /// in the modifier field exactly where shift would, and an Enter under it
+    /// is the plain one — nothing this model may read as a line break.
+    #[test]
+    fn a_lock_latched_on_its_own_does_not_break_the_line() {
+        let mut input = Input::new(false);
+        input.feed(b"ab");
+        input.feed(b"\x1b[13;65u");
+        input.feed(b"cd");
+
+        assert_eq!(input.line(), "abcd");
     }
 
     /// The terminal answers on the channel the user types on — a focus report,

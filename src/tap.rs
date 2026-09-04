@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::input::{Event, SharedInput};
 use crate::painter::Painter;
 use crate::parser::Parser;
-use crate::screen::{Line, SharedScreen};
+use crate::screen::{Line, Look, SharedScreen};
 
 const LOG_VAR: &str = "BLACKJACK_DEBUG_LOG";
 
@@ -38,15 +38,6 @@ impl Log {
             let _ = writeln!(file, "{line}");
         }
     }
-}
-
-/// One reading of the screen: the line the last frame left, where the program
-/// is holding its cursor, and whether it has a frame open right now. Read apart
-/// they can come from two different shapes of the screen.
-struct Look {
-    line: Option<Line>,
-    cursor: (usize, usize),
-    mid_frame: bool,
 }
 
 /// The wrapped program's output on its way to the terminal, with a copy fed to
@@ -94,14 +85,14 @@ impl<W: Write> Tap<W> {
     /// to say, and it covers the cursor, which nothing else ever reopens. The
     /// line it read the screen's account as goes on to the painter either way:
     /// corrected or not, that is the line the user typed.
-    fn resync(&mut self, frame_line: Option<Line>) -> Option<Line> {
+    fn resync(&mut self, frame_line: Option<&Line>) -> Option<Line> {
         let Ok(mut input) = self.input.lock() else {
             return None;
         };
         // Taken on every frame, box or none, or a keystroke from an older frame
         // eats the first correction the box comes back for.
         let raced = input.raced_the_frame();
-        let typed = input.rejoin(&frame_line?);
+        let typed = input.rejoin(frame_line?);
         if (input.stale() || !raced) && input.resync(&typed) {
             self.log.line(format_args!(
                 "resync \"{}\" @{}",
@@ -118,35 +109,21 @@ impl<W: Write> Tap<W> {
     /// the last frame left is read again, which is the one that has been held
     /// still long enough to be worth checking.
     pub fn tick(&mut self) {
-        let Some(mut look) = self.look() else {
+        let Some(look) = self.screen.lock().ok().map(|screen| screen.look()) else {
             return;
         };
-        let Some(line) = look.line.take() else {
-            return;
-        };
-        let typed = {
-            let Ok(input) = self.input.lock() else {
-                return;
-            };
-            input.rejoin(&line)
-        };
-        self.paint(Some(&typed), &look);
+        let typed = look.line.as_ref().and_then(|line| self.rejoined(line));
+        self.paint(typed.as_ref(), &look);
     }
 
-    /// One look at the screen for all of it: a resize lands on another thread,
-    /// so reading the line at one shape and the paint's coordinates at another
-    /// would underline a place neither shape has.
-    fn look(&self) -> Option<Look> {
-        let screen = self.screen.lock().ok()?;
-        Some(Look {
-            line: screen.frame_line(),
-            cursor: screen.cursor(),
-            mid_frame: screen.mid_frame(),
-        })
+    /// The line as the input model reads it, which is the line the user typed
+    /// rather than the one the box wrapped.
+    fn rejoined(&self, line: &Line) -> Option<Line> {
+        Some(self.input.lock().ok()?.rejoin(line))
     }
 
     fn paint(&mut self, line: Option<&Line>, look: &Look) {
-        let Some(paint) = self.painter.paint(line, look.cursor, look.mid_frame) else {
+        let Some(paint) = self.painter.paint(line, look) else {
             return;
         };
         // Written past the parser, so the model of the screen the program
@@ -196,16 +173,12 @@ impl<W: Write> Write for Tap<W> {
             let frames = screen.frames();
             let closed = frames != self.frames;
             self.frames = frames;
-            closed.then(|| Look {
-                line: screen.frame_line(),
-                cursor: (row, col),
-                mid_frame: screen.mid_frame(),
-            })
+            closed.then(|| screen.look())
         };
-        let Some(mut look) = ended else {
+        let Some(look) = ended else {
             return Ok(written);
         };
-        let typed = self.resync(look.line.take());
+        let typed = self.resync(look.line.as_ref());
         self.paint(typed.as_ref(), &look);
         Ok(written)
     }
@@ -327,7 +300,7 @@ mod tests {
 
     /// What the underline for `teh` in a one-row box looks like on the wire.
     const UNDERLINED: &[u8] =
-        b"\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l";
+        b"\x1b[?2026h\x1b[0m\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l";
 
     /// A tap over a box of the given shape, painting what its checker flags.
     fn painting(
@@ -507,10 +480,7 @@ mod tests {
         // frame after, once there is a line that has held still.
         out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
         out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
-        let written = String::from_utf8(out.out.clone()).expect("what the terminal saw");
-        assert!(written.ends_with(
-            "\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l"
-        ));
+        assert!(out.out.ends_with(UNDERLINED), "{:?}", painted(&out));
         assert_eq!(screen.lock().expect("screen").frames(), 2);
     }
 
@@ -526,6 +496,29 @@ mod tests {
         let home = b"\x1b[1;1H";
         out.write_all(home).expect("a read with no frame in it");
         assert_eq!(out.out.len(), painted + home.len());
+    }
+
+    /// Whatever the paint did to the terminal, the program's cursor is where
+    /// the program left it: replaying everything the terminal saw lands the
+    /// cursor exactly where replaying the program's own bytes does.
+    #[test]
+    fn the_paint_leaves_the_cursor_where_the_program_put_it() {
+        let mut out = fake(&["teh"]);
+        // Held at the start of the line, not at the end of the flagged word:
+        // there the underline ends where the cursor already is, and a paint
+        // that never put it back would look like one that did.
+        out.write_all(boxed("teh", 0).as_bytes()).expect("draw");
+        out.write_all(boxed("teh", 0).as_bytes()).expect("redraw");
+        assert!(painted(&out).contains("\x1b[4:3m"), "nothing was painted");
+
+        let replay = |bytes: &[u8]| {
+            let mut terminal = Screen::new(20, 3);
+            Parser::new().advance(&mut terminal, bytes);
+            terminal.look().cursor
+        };
+        let unwrapped = boxed("teh", 0).repeat(2);
+
+        assert_eq!(replay(&out.out), replay(unwrapped.as_bytes()));
     }
 
     /// The user stops typing and the program stops drawing: the frame that
