@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod harper;
 mod input;
+mod painter;
 mod parser;
 mod pty;
 mod resolve;

@@ -51,6 +51,11 @@ pub struct Screen {
     /// How many synchronized-output frames the program has finished. A redraw
     /// lands between them, so this is the only moment the grid is worth reading.
     frames: u64,
+    /// Whether the program has a frame open. Synchronized output is a flag and
+    /// not a count, so anything written between the open and the close ends the
+    /// program's frame instead of its own — tearing a half-drawn redraw onto
+    /// the screen.
+    mid_frame: bool,
     /// The input line as the frame counted above left it. A pty read ends
     /// wherever the kernel filled the buffer, so a reader that looks when its
     /// own read is done sees a half-drawn box; this is taken at the boundary.
@@ -83,6 +88,7 @@ impl Screen {
             margins: (0, rows - 1),
             main: None,
             frames: 0,
+            mid_frame: false,
             frame_line: None,
         }
     }
@@ -133,6 +139,10 @@ impl Screen {
         self.frames
     }
 
+    pub fn mid_frame(&self) -> bool {
+        self.mid_frame
+    }
+
     /// What `input_row` said at the end of the last frame, which is the only
     /// moment the box is whole. Its line breaks are the rows the box drew and
     /// not yet the ones the user typed — only the line being replaced can tell
@@ -150,16 +160,7 @@ impl Screen {
     /// A cursor outside the box goes to the nearer end of the line, which is
     /// the most that can be said of it.
     fn input_row(&self) -> Option<(String, usize)> {
-        let first = (1..self.rows)
-            .rev()
-            .find(|&row| self.starts_with_prompt(row) && self.is_border(row - 1))?;
-        let below = (first + 1..self.rows).find(|&row| self.is_border(row))?;
-        // The row the cursor sits on belongs to the line even while it holds
-        // nothing, which is what keeps a line break the user just typed.
-        let last = (first..below)
-            .rev()
-            .find(|&row| row == self.row || self.written_to(row) > PROMPT.len())
-            .unwrap_or(first);
+        let (first, last) = self.box_rows()?;
         let mut text = String::new();
         let mut cursor = None;
         for row in first..=last {
@@ -185,6 +186,49 @@ impl Screen {
             text,
             cursor.unwrap_or(if self.row < first { 0 } else { end_of_line }),
         ))
+    }
+
+    /// The first and last row of the box: the prompt standing under a border,
+    /// down to the last row holding anything — or the one the cursor is on,
+    /// which belongs to the line even while it holds nothing.
+    fn box_rows(&self) -> Option<(usize, usize)> {
+        let first = (1..self.rows)
+            .rev()
+            .find(|&row| self.starts_with_prompt(row) && self.is_border(row - 1))?;
+        let below = (first + 1..self.rows).find(|&row| self.is_border(row))?;
+        let last = (first..below)
+            .rev()
+            .find(|&row| row == self.row || self.written_to(row) > PROMPT.len())
+            .unwrap_or(first);
+        Some((first, last))
+    }
+
+    /// Where a word of the line sits on the grid, as the row and the column it
+    /// starts in. A word the box broke across two rows is not found, which is
+    /// as far as one fixed word needs to go: the checker that will ask this for
+    /// real hands over positions in the line, not words to look for.
+    pub fn word_in_box(&self, word: &str) -> Option<(usize, usize)> {
+        let (first, last) = self.box_rows()?;
+        (first..=last).find_map(|row| {
+            (PROMPT.len()..self.cols)
+                .find(|&col| self.spells(row, col, word))
+                .map(|col| (row, col))
+        })
+    }
+
+    /// Whether the cells from a column on spell the word and nothing more — the
+    /// continuation of a double-width character skipped, a dim cell reading as
+    /// the blank it stands for so the placeholder is never underlined, and a
+    /// letter or a digit on either side meaning this is part of a longer word.
+    fn spells(&self, row: usize, col: usize, word: &str) -> bool {
+        let at = row * self.cols;
+        let mut cells = (at + col..at + self.cols).filter_map(|cell| self.char_at(cell));
+        let before = (PROMPT.len()..col)
+            .rev()
+            .find_map(|col| self.char_at(at + col));
+        !before.is_some_and(char::is_alphanumeric)
+            && word.chars().all(|c| cells.next() == Some(c))
+            && !cells.next().is_some_and(char::is_alphanumeric)
     }
 
     fn starts_with_prompt(&self, row: usize) -> bool {
@@ -446,9 +490,12 @@ impl Perform for Screen {
                     _ => {}
                 }
             }
-            if action == 'l' && mode(SYNCHRONIZED_OUTPUT) {
-                self.frames += 1;
-                self.frame_line = self.input_row();
+            if mode(SYNCHRONIZED_OUTPUT) {
+                self.mid_frame = action == 'h';
+                if action == 'l' {
+                    self.frames += 1;
+                    self.frame_line = self.input_row();
+                }
             }
             return;
         }

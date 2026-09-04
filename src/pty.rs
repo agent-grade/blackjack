@@ -10,6 +10,7 @@ use signal_hook::iterator::Signals;
 
 use crate::cli::Command;
 use crate::input::{Input, SharedInput};
+use crate::painter::Painter;
 use crate::resolve;
 use crate::screen::{Screen, SharedScreen};
 use crate::tap::{InputTap, Log, Tap};
@@ -83,7 +84,7 @@ pub fn run(command: &Command) -> Result<u32> {
         }
     });
 
-    let mut tap = Tap::new(std::io::stdout(), screen, input, log);
+    let mut tap = Tap::new(std::io::stdout(), screen, input, Painter::open(), log);
     pump(&mut from_child, &mut tap);
     tap.log_final_grid();
 
