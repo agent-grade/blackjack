@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use vte::{Params, Perform};
 
 use crate::parser::Parser;
@@ -6,6 +8,7 @@ use crate::screen::param_as_written;
 const ESC: u8 = 0x1b;
 const DEL: char = '\u{7f}';
 const NONE: u16 = 0;
+const SHIFT: u16 = 0b1;
 const ALT: u16 = 0b10;
 const CTRL: u16 = 0b100;
 /// Caps lock and num lock ride in the modifier field beside the keys held down,
@@ -21,6 +24,11 @@ pub enum Event {
     Submit { line: String, edited: bool },
     Edit,
 }
+
+/// Shared because the line is rebuilt on the thread forwarding the keystrokes
+/// and corrected on the one reading the program's output, at the frame boundary
+/// where the program has finished saying what it is showing.
+pub type SharedInput = Arc<Mutex<Input>>;
 
 /// The line the user is typing, rebuilt from the bytes on their way to the
 /// wrapped program. Nothing tells a wrapper what was typed either, so this is
@@ -82,6 +90,78 @@ impl Input {
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.buffer.events)
     }
+
+    pub fn stale(&self) -> bool {
+        self.buffer.stale
+    }
+
+    /// Whether the user has touched the line since this was last asked. The
+    /// screen it will be drawn on is the next one, so a line that merely
+    /// disagrees with this one is the model running ahead rather than wrong.
+    pub fn raced_the_frame(&mut self) -> bool {
+        std::mem::take(&mut self.buffer.fed)
+    }
+
+    /// Take the line from the screen. The program draws what it is really
+    /// holding, so where the two disagree this model is the one that is wrong.
+    /// Answers whether the screen had anything to say that was not already
+    /// here — the comparison belongs beside the rejoining below, which is what
+    /// the screen's account has to be read through first.
+    pub fn resync(&mut self, text: String, cursor: usize) -> bool {
+        let (text, cursor) = self.rejoined(text, cursor);
+        let buffer = &mut self.buffer;
+        let corrected = text != buffer.text || cursor != buffer.cursor;
+        buffer.at = text
+            .char_indices()
+            .nth(cursor)
+            .map_or(text.len(), |(at, _)| at);
+        buffer.text = text;
+        buffer.cursor = cursor;
+        buffer.stale = false;
+        buffer.edited = false;
+        corrected
+    }
+
+    /// Every row of the box after the first is one the screen offers a break
+    /// for, and the grid draws three different things that way: a word wrapped
+    /// with the space it broke at elided, a word too long to fit broken in the
+    /// middle, and a break the user typed. Only the line being replaced tells
+    /// them apart — at that point it holds the space, nothing, or the break.
+    /// The middle case is the one that shortens what the screen handed over,
+    /// which is why the cursor comes back through here as well.
+    fn rejoined(&self, text: String, cursor: usize) -> (String, usize) {
+        // A line this model has no account of — recalled from history, or told
+        // to it by a key it could not carry out — is one whose breaks it cannot
+        // read: each stands for the space, which at least keeps words apart.
+        if self.buffer.stale {
+            return (text.replace('\n', " "), cursor);
+        }
+        let mut replaced = self.buffer.text.chars().peekable();
+        let mut line = String::with_capacity(text.len());
+        let mut moved = cursor;
+        for (at, c) in text.chars().enumerate() {
+            if c != '\n' {
+                replaced.next();
+                line.push(c);
+                continue;
+            }
+            match replaced.peek() {
+                Some('\n') => line.push('\n'),
+                Some(' ') => line.push(' '),
+                // A word the box broke: nothing was typed where it broke, so
+                // the line takes nothing — and neither does the cursor, which
+                // is counted in what the screen drew.
+                Some(_) => {
+                    moved -= usize::from(at < cursor);
+                    continue;
+                }
+                // The screen is holding more than this model ever saw.
+                None => line.push(' '),
+            }
+            replaced.next();
+        }
+        (line, moved)
+    }
 }
 
 /// What a key does to the line. `Unapplied` is the rest: recorded so that the
@@ -103,6 +183,8 @@ enum Key {
     /// Alt+Backspace, whose word ends where readline's does — at the first
     /// character that is not alphanumeric.
     KillWord,
+    /// Shift+Enter, which breaks the line inside the box instead of sending it.
+    Break,
     Unapplied,
 }
 
@@ -129,6 +211,15 @@ struct Buffer {
     /// the box holds none of them, and the chords an escape sequence in the
     /// body would spell were never pressed.
     pasting: bool,
+    /// Set by a key this model records but does not apply, and by a submit —
+    /// both leave it holding a line the program has since redrawn from
+    /// somewhere this model cannot see.
+    stale: bool,
+    /// Set by what the user does to the line and taken by the frame that asks,
+    /// so that a frame drawn before them can be told from one that disagrees.
+    /// The terminal answers on this channel too — focus reports, device
+    /// replies — and none of that is anybody typing.
+    fed: bool,
     /// SS3 (`ESC O`, how an arrow arrives without the kitty protocol) shifts
     /// exactly the next character out of the text — and the parser reports the
     /// shift, then prints that character like any other.
@@ -141,6 +232,7 @@ impl Buffer {
         let edited = std::mem::take(&mut self.edited);
         self.cursor = 0;
         self.at = 0;
+        self.stale = true;
         self.events.push(Event::Submit { line, edited });
     }
 
@@ -176,6 +268,7 @@ impl Buffer {
     }
 
     fn insert(&mut self, c: char) {
+        self.fed = true;
         self.text.insert(self.at, c);
         self.cursor += 1;
         self.at += c.len_utf8();
@@ -204,6 +297,7 @@ impl Buffer {
         if self.pasting {
             return;
         }
+        self.fed = true;
         match key {
             Key::Backspace => {
                 if self.cursor > 0 {
@@ -233,8 +327,10 @@ impl Buffer {
                 let start = self.start_of_word(word_boundary);
                 self.cut_back_to(start);
             }
+            Key::Break => self.insert('\n'),
             Key::Unapplied => {
                 self.edited = true;
+                self.stale = true;
                 self.events.push(Event::Edit);
             }
         }
@@ -372,6 +468,11 @@ fn sequence_key(params: &Params, action: char) -> Option<Key> {
 /// `CSI <codepoint> ; <modifiers> u`, the encoding Claude Code asks for.
 /// Backspace arrives here as 127; Delete keeps its `CSI 3~` form.
 fn kitty_key(codepoint: u16, modifiers: u16) -> Option<Key> {
+    // Enter reaches this encoding only when it is not a submit: shift+Enter
+    // breaks the line inside the box. Plain Enter stays a carriage return.
+    if codepoint == 13 && modifiers == SHIFT {
+        return Some(Key::Break);
+    }
     if codepoint == 127 {
         return Some(match modifiers {
             NONE => Key::Backspace,
@@ -400,6 +501,53 @@ fn kitty_key(codepoint: u16, modifiers: u16) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The box breaks a word too long for its width, and nothing was typed
+    /// where it broke — so the line closes back up, and the cursor with it.
+    #[test]
+    fn a_word_the_box_broke_is_put_back_together() {
+        let mut input = Input::new(false);
+        input.feed(b"abcdefghij");
+        // The screen is saying exactly what this model holds, in rows.
+        assert!(!input.resync("abcdef\nghij".into(), 11));
+        assert_eq!(input.line(), "abcdefghij");
+        assert_eq!(input.cursor(), 10);
+    }
+
+    /// A wrap at a space elides it, and the line being replaced is what says a
+    /// space was there to elide.
+    #[test]
+    fn the_space_the_box_wrapped_at_comes_back() {
+        let mut input = Input::new(false);
+        input.feed(b"abc def");
+        input.resync("abc\ndef".into(), 7);
+        assert_eq!(input.line(), "abc def");
+    }
+
+    /// A recalled line is one this model has no account of: the line it holds
+    /// is the one being replaced, so reading the new line's breaks against it
+    /// answers nothing. They are read as the spaces that keep words apart.
+    #[test]
+    fn the_breaks_of_a_recalled_line_are_read_as_spaces() {
+        let mut input = Input::new(false);
+        input.feed(b"abcdef");
+        input.feed(b"\x1b[A");
+        input.resync("abc\ndef".into(), 7);
+        assert_eq!(input.line(), "abc def");
+    }
+
+    /// The terminal answers on the channel the user types on — a focus report,
+    /// a device reply — and none of that is anybody racing a frame.
+    #[test]
+    fn a_report_from_the_terminal_is_not_the_user_typing() {
+        let mut input = Input::new(false);
+        input.feed(b"\x1b[I");
+        assert!(!input.raced_the_frame());
+        input.feed(b"a");
+        assert!(input.raced_the_frame());
+        input.feed(b"\x1b[D");
+        assert!(input.raced_the_frame());
+    }
 
     fn typed(chunks: &[&[u8]]) -> Input {
         piped(false, chunks)

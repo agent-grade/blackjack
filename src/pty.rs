@@ -9,6 +9,7 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
 use crate::cli::Command;
+use crate::input::{Input, SharedInput};
 use crate::resolve;
 use crate::screen::{Screen, SharedScreen};
 use crate::tap::{InputTap, Log, Tap};
@@ -57,6 +58,7 @@ pub fn run(command: &Command) -> Result<u32> {
     // dropped and end-of-input is signalled deliberately below.
     let mut to_child = ManuallyDrop::new(to_child);
     let piped_stdin = !std::io::stdin().is_terminal();
+    let input: SharedInput = Arc::new(Mutex::new(Input::new(piped_stdin)));
     let log = Log::open();
 
     // Registered before raw mode is entered: a signal arriving in between would
@@ -66,9 +68,10 @@ pub fn run(command: &Command) -> Result<u32> {
 
     // Detached: this read blocks, and the child exiting must not wait on a keystroke.
     let typed = log.clone();
+    let typed_input = input.clone();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
-        let mut to_child = InputTap::new(&mut *to_child, typed, piped_stdin);
+        let mut to_child = InputTap::new(&mut *to_child, typed_input, typed);
         pump(&mut stdin, &mut to_child);
         if piped_stdin {
             // The first EOT flushes a partial line, the second ends the input.
@@ -80,7 +83,7 @@ pub fn run(command: &Command) -> Result<u32> {
         }
     });
 
-    let mut tap = Tap::new(std::io::stdout(), screen, log);
+    let mut tap = Tap::new(std::io::stdout(), screen, input, log);
     pump(&mut from_child, &mut tap);
     tap.log_final_grid();
 
