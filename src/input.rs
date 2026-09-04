@@ -110,6 +110,11 @@ enum Key {
 struct Buffer {
     text: String,
     cursor: usize,
+    /// Where `cursor` is in bytes. Carried rather than counted, because finding
+    /// it by walking the line makes every insertion cost the length so far, and
+    /// a line can arrive in bulk — piped, or pasted into a terminal that does
+    /// not bracket it.
+    at: usize,
     events: Vec<Event>,
     edited: bool,
     /// A pipe has no Enter key: its lines end with a line feed, which on a
@@ -132,61 +137,64 @@ impl Buffer {
         let line = std::mem::take(&mut self.text);
         let edited = std::mem::take(&mut self.edited);
         self.cursor = 0;
+        self.at = 0;
         self.events.push(Event::Submit { line, edited });
-    }
-
-    /// Where the character at `chars` starts, or the end of the line.
-    fn byte_of(&self, chars: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(chars)
-            .map_or(self.text.len(), |(at, _)| at)
-    }
-
-    fn chars(&self) -> usize {
-        self.text.chars().count()
     }
 
     /// Back over the run of boundary characters the cursor sits in, then back
     /// over the word before it. Both kills work this way and differ only in
     /// what they count as a boundary.
-    fn start_of_word(&self, boundary: impl Fn(char) -> bool) -> usize {
-        let mut at = self.cursor;
+    fn start_of_word(&self, boundary: impl Fn(char) -> bool) -> (usize, usize) {
+        let (mut cursor, mut at) = (self.cursor, self.at);
         let mut in_word = false;
-        for c in self.text[..self.byte_of(self.cursor)].chars().rev() {
+        for c in self.text[..self.at].chars().rev() {
             if boundary(c) && in_word {
                 break;
             }
             in_word |= !boundary(c);
-            at -= 1;
+            cursor -= 1;
+            at -= c.len_utf8();
         }
-        at
+        (cursor, at)
     }
 
-    fn end_of_word(&self) -> usize {
-        let mut at = self.cursor;
+    fn end_of_word(&self) -> (usize, usize) {
+        let (mut cursor, mut at) = (self.cursor, self.at);
         let mut in_word = false;
-        for c in self.text[self.byte_of(self.cursor)..].chars() {
+        for c in self.text[self.at..].chars() {
             if word_boundary(c) && in_word {
                 break;
             }
             in_word |= !word_boundary(c);
-            at += 1;
+            cursor += 1;
+            at += c.len_utf8();
         }
-        at
+        (cursor, at)
+    }
+
+    fn insert(&mut self, c: char) {
+        self.text.insert(self.at, c);
+        self.cursor += 1;
+        self.at += c.len_utf8();
     }
 
     fn remove_at_cursor(&mut self) {
-        let at = self.byte_of(self.cursor);
-        if at < self.text.len() {
-            self.text.remove(at);
+        if self.at < self.text.len() {
+            self.text.remove(self.at);
         }
     }
 
-    fn cut_back_to(&mut self, start: usize) {
-        let range = self.byte_of(start)..self.byte_of(self.cursor);
-        self.text.replace_range(range, "");
-        self.cursor = start;
+    fn cut_back_to(&mut self, (cursor, at): (usize, usize)) {
+        self.text.replace_range(at..self.at, "");
+        self.cursor = cursor;
+        self.at = at;
+    }
+
+    fn step_left(&mut self) {
+        if let Some(c) = self.text[..self.at].chars().next_back() {
+            self.cursor -= 1;
+            self.at -= c.len_utf8();
+        }
     }
 
     fn apply(&mut self, key: Key) {
@@ -196,19 +204,24 @@ impl Buffer {
         match key {
             Key::Backspace => {
                 if self.cursor > 0 {
-                    self.cursor -= 1;
+                    self.step_left();
                     self.remove_at_cursor();
                 }
             }
             Key::Delete => self.remove_at_cursor(),
-            Key::Left => self.cursor = self.cursor.saturating_sub(1),
-            Key::Right => self.cursor = (self.cursor + 1).min(self.chars()),
-            Key::WordLeft => self.cursor = self.start_of_word(word_boundary),
-            Key::WordRight => self.cursor = self.end_of_word(),
-            Key::Home => self.cursor = 0,
-            Key::End => self.cursor = self.chars(),
-            Key::KillToStart => self.cut_back_to(0),
-            Key::KillToEnd => self.text.truncate(self.byte_of(self.cursor)),
+            Key::Left => self.step_left(),
+            Key::Right => {
+                if let Some(c) = self.text[self.at..].chars().next() {
+                    self.cursor += 1;
+                    self.at += c.len_utf8();
+                }
+            }
+            Key::WordLeft => (self.cursor, self.at) = self.start_of_word(word_boundary),
+            Key::WordRight => (self.cursor, self.at) = self.end_of_word(),
+            Key::Home => (self.cursor, self.at) = (0, 0),
+            Key::End => (self.cursor, self.at) = (self.text.chars().count(), self.text.len()),
+            Key::KillToStart => self.cut_back_to((0, 0)),
+            Key::KillToEnd => self.text.truncate(self.at),
             Key::KillToWhitespace => {
                 let start = self.start_of_word(char::is_whitespace);
                 self.cut_back_to(start);
@@ -235,9 +248,7 @@ impl Perform for Buffer {
             self.apply(Key::Backspace);
             return;
         }
-        let at = self.byte_of(self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
+        self.insert(c);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -504,6 +515,32 @@ mod tests {
         let input = typed(&[b"helo\x1b[Dl"]);
         assert_eq!(input.line(), "hello");
         assert_eq!(input.cursor(), 4);
+    }
+
+    /// Every character after the first has to move the cursor's byte offset as
+    /// well as its char index — a shortcut that keeps only the char index puts
+    /// them into the line backwards.
+    #[test]
+    fn characters_typed_mid_line_go_in_in_order() {
+        let input = typed(&[b"a\xe4\xb8\xadd\x1b[Dbc"]);
+        assert_eq!(input.line(), "a\u{4e2d}bcd");
+        assert_eq!(input.cursor(), 4);
+    }
+
+    /// Bulk input arrives one character at a time, so an insertion that costs
+    /// the length so far costs the square of the line — and the model is fed on
+    /// the thread that forwards the keystrokes.
+    #[test]
+    fn a_hundred_thousand_characters_go_in_under_a_second() {
+        let body = vec![b'x'; 100_000];
+        let start = std::time::Instant::now();
+        let mut input = Input::new(false);
+        for chunk in body.chunks(4096) {
+            input.feed(chunk);
+        }
+        assert_eq!(input.line().len(), body.len());
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
     }
 
     #[test]
