@@ -4,11 +4,17 @@ use crate::screen::param_as_written;
 
 const ESC: u8 = 0x1b;
 const DEL: char = '\u{7f}';
-/// The ctrl bit of a kitty key's modifier field.
+const NONE: u16 = 0;
+const ALT: u16 = 0b10;
 const CTRL: u16 = 0b100;
+/// Caps lock and num lock ride in the modifier field beside the keys held down,
+/// so a latched lock would otherwise make every key a combination none of the
+/// tables below name.
+const LOCKS: u16 = 0b1100_0000;
 
-/// Recorded on the way past, never applied. `edited` means an edit key was seen
-/// on this line; a paste never sets it.
+/// `Submit` carries the line as it was typed. `edited` means a key was seen
+/// that this model records but does not apply, so the line is no longer the one
+/// being looked at. A paste never sets it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Submit { line: String, edited: bool },
@@ -45,7 +51,7 @@ impl Input {
             if self.held_escape {
                 self.held_escape = false;
                 if rest[0] as char == DEL {
-                    self.buffer.edit();
+                    self.buffer.apply(Key::KillWord);
                     rest = &rest[1..];
                 } else {
                     self.parser.advance(&mut self.buffer, &[ESC]);
@@ -66,14 +72,43 @@ impl Input {
         &self.buffer.text
     }
 
+    /// Where in the line the next character goes, counted in characters — the
+    /// columns a painter needs come from the screen model, not from here.
+    pub fn cursor(&self) -> usize {
+        self.buffer.cursor
+    }
+
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.buffer.events)
     }
 }
 
+/// What a key does to the line. `Unapplied` is the rest: recorded so that the
+/// submit carrying the line can say it is no longer the one being looked at.
+#[derive(Clone, Copy)]
+enum Key {
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    Home,
+    End,
+    KillToStart,
+    KillToEnd,
+    /// ctrl-W, whose word ends at whitespace.
+    KillToWhitespace,
+    /// Alt+Backspace, whose word ends where readline's does — at the first
+    /// character that is not alphanumeric.
+    KillWord,
+    Unapplied,
+}
+
 #[derive(Default)]
 struct Buffer {
     text: String,
+    cursor: usize,
     events: Vec<Event>,
     edited: bool,
     /// A pipe has no Enter key: its lines end with a line feed, which on a
@@ -95,15 +130,97 @@ impl Buffer {
     fn submit(&mut self) {
         let line = std::mem::take(&mut self.text);
         let edited = std::mem::take(&mut self.edited);
+        self.cursor = 0;
         self.events.push(Event::Submit { line, edited });
     }
 
-    fn edit(&mut self) {
+    /// Where the character at `chars` starts, or the end of the line.
+    fn byte_of(&self, chars: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(chars)
+            .map_or(self.text.len(), |(at, _)| at)
+    }
+
+    fn chars(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Back over the run of boundary characters the cursor sits in, then back
+    /// over the word before it. Both kills work this way and differ only in
+    /// what they count as a boundary.
+    fn start_of_word(&self, boundary: impl Fn(char) -> bool) -> usize {
+        let mut at = self.cursor;
+        let mut in_word = false;
+        for c in self.text[..self.byte_of(self.cursor)].chars().rev() {
+            if boundary(c) && in_word {
+                break;
+            }
+            in_word |= !boundary(c);
+            at -= 1;
+        }
+        at
+    }
+
+    fn end_of_word(&self) -> usize {
+        let mut at = self.cursor;
+        let mut in_word = false;
+        for c in self.text[self.byte_of(self.cursor)..].chars() {
+            if word_boundary(c) && in_word {
+                break;
+            }
+            in_word |= !word_boundary(c);
+            at += 1;
+        }
+        at
+    }
+
+    fn remove_at_cursor(&mut self) {
+        let at = self.byte_of(self.cursor);
+        if at < self.text.len() {
+            self.text.remove(at);
+        }
+    }
+
+    fn cut_back_to(&mut self, start: usize) {
+        let range = self.byte_of(start)..self.byte_of(self.cursor);
+        self.text.replace_range(range, "");
+        self.cursor = start;
+    }
+
+    fn apply(&mut self, key: Key) {
         if self.pasting {
             return;
         }
-        self.edited = true;
-        self.events.push(Event::Edit);
+        match key {
+            Key::Backspace => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.remove_at_cursor();
+                }
+            }
+            Key::Delete => self.remove_at_cursor(),
+            Key::Left => self.cursor = self.cursor.saturating_sub(1),
+            Key::Right => self.cursor = (self.cursor + 1).min(self.chars()),
+            Key::WordLeft => self.cursor = self.start_of_word(word_boundary),
+            Key::WordRight => self.cursor = self.end_of_word(),
+            Key::Home => self.cursor = 0,
+            Key::End => self.cursor = self.chars(),
+            Key::KillToStart => self.cut_back_to(0),
+            Key::KillToEnd => self.text.truncate(self.byte_of(self.cursor)),
+            Key::KillToWhitespace => {
+                let start = self.start_of_word(char::is_whitespace);
+                self.cut_back_to(start);
+            }
+            Key::KillWord => {
+                let start = self.start_of_word(word_boundary);
+                self.cut_back_to(start);
+            }
+            Key::Unapplied => {
+                self.edited = true;
+                self.events.push(Event::Edit);
+            }
+        }
     }
 }
 
@@ -114,10 +231,12 @@ impl Perform for Buffer {
             return;
         }
         if c == DEL {
-            self.edit();
+            self.apply(Key::Backspace);
             return;
         }
-        self.text.push(c);
+        let at = self.byte_of(self.cursor);
+        self.text.insert(at, c);
+        self.cursor += 1;
     }
 
     fn execute(&mut self, byte: u8) {
@@ -131,10 +250,11 @@ impl Perform for Buffer {
                 self.after_return = true;
             }
             0x0a if self.from_a_pipe && !after_return => self.submit(),
-            // Backspace, and the ctrl chords that move the cursor or cut text:
-            // a, e, k, u, w.
-            0x08 | 0x01 | 0x05 | 0x0b | 0x15 | 0x17 => self.edit(),
-            _ => {}
+            _ => {
+                if let Some(key) = control_key(byte) {
+                    self.apply(key);
+                }
+            }
         }
     }
 
@@ -145,18 +265,15 @@ impl Perform for Buffer {
         if ignore || !intermediates.is_empty() {
             return;
         }
-        match action {
-            '~' => match param_as_written(params, 0) {
-                200 => self.pasting = true,
-                201 => self.pasting = false,
-                // Delete, and Home and End in their numbered forms.
-                1 | 3 | 4 | 7 | 8 => self.edit(),
+        if action == '~' {
+            match param_as_written(params, 0) {
+                200 => return self.pasting = true,
+                201 => return self.pasting = false,
                 _ => {}
-            },
-            // Arrows, Home and End as plain keys.
-            'A'..='D' | 'H' | 'F' => self.edit(),
-            'u' if edits_the_line(params) => self.edit(),
-            _ => {}
+            }
+        }
+        if let Some(key) = sequence_key(params, action) {
+            self.apply(key);
         }
     }
 
@@ -167,14 +284,80 @@ impl Perform for Buffer {
     }
 }
 
-/// The kitty encoding Claude Code asks for, in which the keys that move the
-/// cursor or cut text arrive as their own codepoint rather than as a control
-/// byte. Its modifier field is the bitmask plus one.
-fn edits_the_line(params: &Params) -> bool {
-    let modifiers = param_as_written(params, 1).saturating_sub(1);
-    param_as_written(params, 0) == 127
-        || (modifiers & CTRL != 0
-            && matches!(param_as_written(params, 0), 97 | 101 | 107 | 117 | 119))
+/// Where readline's word kills and word moves stop: a word is a run of
+/// alphanumerics, and everything else is between words.
+fn word_boundary(c: char) -> bool {
+    !c.is_alphanumeric()
+}
+
+/// The ctrl chords a line editor binds, as the C0 bytes they arrive as.
+fn control_key(byte: u8) -> Option<Key> {
+    Some(match byte {
+        0x08 => Key::Backspace,
+        0x01 => Key::Home,
+        0x05 => Key::End,
+        0x0b => Key::KillToEnd,
+        0x15 => Key::KillToStart,
+        0x17 => Key::KillToWhitespace,
+        // Yank and transpose, which need a kill ring and a swap.
+        0x14 | 0x19 => Key::Unapplied,
+        _ => return None,
+    })
+}
+
+/// The editing keys as a terminal sends them. A modifier field is the bitmask
+/// plus one, and absent it reads as no modifier at all; a combination none of
+/// these arms names is a key this model cannot claim to know.
+fn sequence_key(params: &Params, action: char) -> Option<Key> {
+    let modifiers = param_as_written(params, 1).saturating_sub(1) & !LOCKS;
+    Some(match (action, modifiers) {
+        // History recall replaces the whole line, which needs the history.
+        ('A' | 'B', _) => Key::Unapplied,
+        ('C', NONE) => Key::Right,
+        ('D', NONE) => Key::Left,
+        ('C', ALT) => Key::WordRight,
+        ('D', ALT) => Key::WordLeft,
+        ('H', NONE) => Key::Home,
+        ('F', NONE) => Key::End,
+        ('C' | 'D' | 'H' | 'F', _) => Key::Unapplied,
+        ('~', _) => match (param_as_written(params, 0), modifiers) {
+            (1 | 7, NONE) => Key::Home,
+            (4 | 8, NONE) => Key::End,
+            (3, NONE) => Key::Delete,
+            (1 | 3 | 4 | 5 | 6 | 7 | 8, _) => Key::Unapplied,
+            _ => return None,
+        },
+        ('u', _) => return kitty_key(param_as_written(params, 0), modifiers),
+        _ => return None,
+    })
+}
+
+/// `CSI <codepoint> ; <modifiers> u`, the encoding Claude Code asks for.
+/// Backspace arrives here as 127; Delete keeps its `CSI 3~` form.
+fn kitty_key(codepoint: u16, modifiers: u16) -> Option<Key> {
+    if codepoint == 127 {
+        return Some(match modifiers {
+            NONE => Key::Backspace,
+            ALT => Key::KillWord,
+            _ => Key::Unapplied,
+        });
+    }
+    let chord = match codepoint {
+        97 => Key::Home,
+        101 => Key::End,
+        107 => Key::KillToEnd,
+        117 => Key::KillToStart,
+        119 => Key::KillToWhitespace,
+        // Yank and transpose, which need a kill ring and a swap.
+        116 | 121 => Key::Unapplied,
+        _ => return None,
+    };
+    Some(match modifiers {
+        CTRL => chord,
+        // The character itself, reported as a sequence.
+        NONE => return None,
+        _ => Key::Unapplied,
+    })
 }
 
 #[cfg(test)]
@@ -292,16 +475,88 @@ mod tests {
     /// since a pasted `\r` and a pasted DEL are ordinary bytes.
     #[test]
     fn a_paste_is_skipped_whole() {
-        let mut input = typed(&[b"ab\x1b[200~pasted\r\x7ftext\x1b[201~cd"]);
+        let mut input = typed(&[b"ab\x1b[200~pasted\r\x7f\x1b[3~text\x1b[201~cd"]);
         assert_eq!(input.line(), "abcd");
         assert_eq!(input.take_events(), vec![]);
     }
 
     #[test]
-    fn backspace_is_recorded_without_changing_the_line() {
-        let mut input = typed(&[b"ab\x7fc"]);
-        assert_eq!(input.line(), "abc");
-        assert_eq!(input.take_events(), vec![Event::Edit]);
+    fn backspace_deletes_the_character_before_the_cursor() {
+        for backspace in [&b"\x7f"[..], b"\x08", b"\x1b[127u"] {
+            let mut input = typed(&[b"ab", backspace, b"c"]);
+            assert_eq!(input.line(), "ac", "for {backspace:?}");
+            assert_eq!(input.take_events(), vec![], "for {backspace:?}");
+        }
+    }
+
+    #[test]
+    fn delete_takes_the_character_the_cursor_is_on() {
+        let input = typed(&[b"abc\x1b[D\x1b[D\x1b[3~"]);
+        assert_eq!(input.line(), "ac");
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn text_goes_in_where_the_cursor_is() {
+        let input = typed(&[b"helo\x1b[Dl"]);
+        assert_eq!(input.line(), "hello");
+        assert_eq!(input.cursor(), 4);
+    }
+
+    #[test]
+    fn the_arrows_stop_at_the_ends_of_the_line() {
+        let input = typed(&[b"ab\x1b[C\x1b[C\x1b[D\x1b[D\x1b[D"]);
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn home_and_end_jump_to_the_ends() {
+        for (home, end) in [
+            (&b"\x1b[H"[..], &b"\x1b[F"[..]),
+            (b"\x1b[1~", b"\x1b[4~"),
+            (b"\x1b[7~", b"\x1b[8~"),
+            (b"\x01", b"\x05"),
+            (b"\x1b[97;5u", b"\x1b[101;5u"),
+        ] {
+            let mut input = typed(&[b"abc", home]);
+            assert_eq!(input.cursor(), 0, "for {home:?}");
+            input.feed(end);
+            assert_eq!(input.cursor(), 3, "for {end:?}");
+        }
+    }
+
+    #[test]
+    fn a_kill_takes_the_line_to_one_side_of_the_cursor() {
+        for (chord, kept) in [
+            (&b"\x15"[..], "cd"),
+            (b"\x1b[117;5u", "cd"),
+            (b"\x0b", "ab"),
+            (b"\x1b[107;5u", "ab"),
+        ] {
+            let input = typed(&[b"abcd\x1b[D\x1b[D", chord]);
+            assert_eq!(input.line(), kept, "for {chord:?}");
+            assert_eq!(input.cursor(), if kept == "cd" { 0 } else { 2 });
+        }
+    }
+
+    /// ctrl-W's word ends at whitespace; Alt+Backspace's ends where readline's
+    /// does, at the first character that is not alphanumeric.
+    #[test]
+    fn the_two_word_kills_end_their_word_differently() {
+        assert_eq!(typed(&[b"one two/three\x17"]).line(), "one ");
+        assert_eq!(typed(&[b"one two/three\x1b[119;5u"]).line(), "one ");
+        assert_eq!(typed(&[b"one two/three\x1b\x7f"]).line(), "one two/");
+        assert_eq!(typed(&[b"one two/three\x1b[127;3u"]).line(), "one two/");
+    }
+
+    #[test]
+    fn alt_moves_the_cursor_a_word_at_a_time() {
+        let mut input = typed(&[b"one two\x1b[1;3D"]);
+        assert_eq!(input.cursor(), 4);
+        input.feed(b"\x1b[1;3D");
+        assert_eq!(input.cursor(), 0);
+        input.feed(b"\x1b[1;3C");
+        assert_eq!(input.cursor(), 3);
     }
 
     /// Alt+Backspace is `ESC DEL`, and the parser reads a DEL inside a sequence
@@ -309,16 +564,16 @@ mod tests {
     /// final byte and leave the line without ever being seen.
     #[test]
     fn alt_backspace_does_not_swallow_the_next_character() {
-        let mut input = typed(&[b"abc\x1b\x7fd"]);
-        assert_eq!(input.line(), "abcd");
-        assert_eq!(input.take_events(), vec![Event::Edit]);
+        let mut input = typed(&[b"one two\x1b\x7fd"]);
+        assert_eq!(input.line(), "one d");
+        assert_eq!(input.take_events(), vec![]);
     }
 
     #[test]
     fn an_escape_split_across_two_reads_is_still_alt_backspace() {
-        let mut input = typed(&[b"abc\x1b", b"\x7fd"]);
-        assert_eq!(input.line(), "abcd");
-        assert_eq!(input.take_events(), vec![Event::Edit]);
+        let mut input = typed(&[b"one two\x1b", b"\x7fd"]);
+        assert_eq!(input.line(), "one d");
+        assert_eq!(input.take_events(), vec![]);
     }
 
     /// A DEL inside a sequence is not a keystroke, and the parser drops it — so
@@ -330,8 +585,6 @@ mod tests {
         assert_eq!(input.take_events(), vec![]);
     }
 
-    /// The edits are recorded and not applied, so the buffer is not the line
-    /// the user meant to send. Ctrl-U cut everything before `world`.
     /// The pairing is between a return and the line feed that closes it, so a
     /// line typed after one still ends where its own return says.
     #[test]
@@ -356,7 +609,7 @@ mod tests {
     /// outlive the submit that carried it.
     #[test]
     fn a_clean_line_after_an_edited_one_submits_clean() {
-        let mut input = piped(true, &[b"a\x15b\nc\n"]);
+        let mut input = piped(true, &[b"a\x19b\nc\n"]);
         assert_eq!(
             input.take_events(),
             vec![Event::Edit, submit("ab", true), submit("c", false)]
@@ -369,56 +622,101 @@ mod tests {
     fn an_unmodified_kitty_key_is_not_an_edit() {
         let mut input = typed(&[b"ab\x1b[97u\x1b[117;1u"]);
         assert_eq!(input.line(), "ab");
+        assert_eq!(input.cursor(), 2);
         assert_eq!(input.take_events(), vec![]);
     }
 
     #[test]
-    fn a_line_that_was_edited_submits_dirty() {
+    fn an_applied_edit_leaves_the_submit_clean() {
         assert_eq!(
             submitted(&[b"hello\x15world\r"]),
-            vec![submit("helloworld", true)]
+            vec![submit("world", false)]
         );
         assert_eq!(
             submitted(&[b"hello\x1b[117;5uworld\r"]),
-            vec![submit("helloworld", true)],
+            vec![submit("world", false)],
             "the kitty encoding of the same chord"
-        );
-        assert_eq!(
-            submitted(&[b"helloworld\r"]),
-            vec![submit("helloworld", false)]
         );
     }
 
+    /// History recall replaces the whole line from somewhere this model cannot
+    /// see, so what it holds is no longer what the user is looking at.
     #[test]
-    fn a_recorded_edit_key_is_seen_without_changing_the_line() {
-        for edit in [
-            &b"\x08"[..],
-            b"\x01",
-            b"\x05",
-            b"\x0b",
-            b"\x15",
-            b"\x17",
-            b"\x1b[A",
-            b"\x1b[B",
-            b"\x1b[C",
-            b"\x1b[D",
-            b"\x1b[1~",
-            b"\x1b[3~",
-            b"\x1b[4~",
-            b"\x1b[7~",
-            b"\x1b[8~",
-            b"\x1b[H",
-            b"\x1b[F",
-            b"\x1b[97;5u",
-            b"\x1b[101;5u",
-            b"\x1b[107;5u",
-            b"\x1b[117;5u",
-            b"\x1b[119;5u",
-            b"\x1b[127u",
+    fn a_key_that_cannot_be_applied_makes_the_submit_dirty() {
+        assert_eq!(
+            submitted(&[b"hello\x1b[Aworld\r"]),
+            vec![submit("helloworld", true)]
+        );
+    }
+
+    /// ctrl-←, shift-←, ctrl-Delete, ctrl-Backspace and shift+ctrl-U: a modifier
+    /// combination none of the tables names is not the bare key, because the
+    /// editor may move by a word where the bare key moves by one. The model
+    /// records the doubt instead of asserting a line it cannot know.
+    #[test]
+    fn a_modifier_the_tables_do_not_name_is_not_the_bare_key() {
+        for key in [
+            &b"\x1b[1;5D"[..],
+            b"\x1b[1;2D",
+            b"\x1b[1;5C",
+            b"\x1b[1;5H",
+            b"\x1b[1;5F",
+            b"\x1b[1;5~",
+            b"\x1b[3;5~",
+            b"\x1b[4;5~",
+            b"\x1b[7;5~",
+            b"\x1b[8;5~",
+            b"\x1b[127;5u",
+            b"\x1b[117;6u",
         ] {
-            let mut input = typed(&[b"ab", edit]);
-            assert_eq!(input.line(), "ab", "for {edit:?}");
-            assert_eq!(input.take_events(), vec![Event::Edit], "for {edit:?}");
+            let mut input = typed(&[b"one two", key]);
+            assert_eq!(input.cursor(), 7, "for {key:?}");
+            input.feed(b"\r");
+            assert_eq!(
+                input.take_events(),
+                vec![Event::Edit, submit("one two", true)],
+                "for {key:?}"
+            );
+        }
+    }
+
+    /// A lock is reported in the same field as the keys actually held down, so
+    /// latching one must not turn a key the tables name into one they do not.
+    #[test]
+    fn a_latched_lock_is_not_a_modifier() {
+        for (key, line, cursor) in [
+            (&b"\x1b[1;65D"[..], "one two", 6),
+            (b"\x1b[1;129D", "one two", 6),
+            (b"\x1b[1;67D", "one two", 4),
+            (b"\x1b[3;65~", "one two", 7),
+            (b"\x1b[127;65u", "one tw", 6),
+            (b"\x1b[97;69u", "one two", 0),
+        ] {
+            let mut input = typed(&[b"one two", key]);
+            assert_eq!(input.line(), line, "for {key:?}");
+            assert_eq!(input.cursor(), cursor, "for {key:?}");
+            assert_eq!(input.take_events(), vec![], "for {key:?}");
+        }
+    }
+
+    /// The keys this model records but cannot carry out: history recall, the
+    /// pages it has no history for, and the chords needing a kill ring or a
+    /// swap.
+    #[test]
+    fn a_key_that_cannot_be_applied_is_recorded_and_changes_nothing() {
+        for key in [
+            &b"\x1b[A"[..],
+            b"\x1b[B",
+            b"\x1b[5~",
+            b"\x1b[6~",
+            b"\x14",
+            b"\x19",
+            b"\x1b[116;5u",
+            b"\x1b[121;5u",
+        ] {
+            let mut input = typed(&[b"ab", key]);
+            assert_eq!(input.line(), "ab", "for {key:?}");
+            assert_eq!(input.take_events(), vec![Event::Edit], "for {key:?}");
         }
     }
 }

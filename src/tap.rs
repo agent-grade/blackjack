@@ -125,9 +125,10 @@ impl<W: Write> Write for InputTap<W> {
             return Ok(written);
         }
         self.log.line(format_args!(
-            "in {written}B \"{}\" -> \"{}\"",
+            "in {written}B \"{}\" -> \"{}\" @{}",
             escape(&buf[..written]),
-            escape(self.input.line().as_bytes())
+            escape(self.input.line().as_bytes()),
+            self.input.cursor()
         ));
         for event in events {
             match event {
