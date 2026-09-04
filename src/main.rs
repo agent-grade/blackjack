@@ -2,6 +2,7 @@ mod cli;
 mod input;
 mod parser;
 mod pty;
+mod resolve;
 mod screen;
 mod tap;
 
