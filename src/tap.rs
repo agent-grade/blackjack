@@ -404,9 +404,10 @@ mod tests {
         String::from_utf8_lossy(&out.out).into_owned()
     }
 
-    /// What the underline for `teh` in a one-row box looks like on the wire.
+    /// What the underline for `teh` in a one-row box looks like on the wire,
+    /// the user having typed the space that finished the word.
     const UNDERLINED: &[u8] =
-        b"\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;6H\x1b[?2026l";
+        b"\x1b[?2026h\x1b[2;3H\x1b[4:3m\x1b[58:2::255:0:0mteh\x1b[59m\x1b[24m\x1b[2;7H\x1b[?2026l";
 
     /// A tap over a box of the given shape, painting what its checker flags.
     fn painting(
@@ -870,8 +871,9 @@ mod tests {
             Painter::checking(Box::new(FakeChecker::spelling(&["teh"]))).logging(log.clone());
         let mut out = Tap::new(Vec::new(), screen, input, painter, log);
 
-        out.write_all(boxed("a teh", 5).as_bytes()).expect("draw");
-        out.write_all(boxed("a teh", 5).as_bytes()).expect("redraw");
+        out.write_all(boxed("a teh ", 6).as_bytes()).expect("draw");
+        out.write_all(boxed("a teh ", 6).as_bytes())
+            .expect("redraw");
         keys.write_all(b"\x1b[46;5u").expect("the fix key");
         keys.write_all(b"\x1b[44;5u").expect("the learn key");
 
@@ -881,7 +883,7 @@ mod tests {
             "out ",
             "resync (",
             "no paint: line changed",
-            "check \"a teh\"",
+            "check \"a teh \"",
             "paint ",
             "fix: ",
             "learn: ",
@@ -914,8 +916,8 @@ mod tests {
         );
         // The first frame is the one that changed the line; the paint is on the
         // frame after, once there is a line that has held still.
-        out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
-        out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("draw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("redraw");
         assert!(out.out.ends_with(UNDERLINED), "{:?}", painted(&out));
         assert_eq!(screen.lock().expect("screen").frames(), 2);
     }
@@ -926,8 +928,8 @@ mod tests {
     #[test]
     fn a_read_that_ends_no_frame_paints_nothing() {
         let mut out = fake(&["teh"]);
-        out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
-        out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("draw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("redraw");
         let painted = out.out.len();
         let home = b"\x1b[1;1H";
         out.write_all(home).expect("a read with no frame in it");
@@ -950,8 +952,8 @@ mod tests {
 
         let checker = Box::new(crate::checker::FakeChecker::spelling(&["teh"]));
         let mut out = painting(checker, 3, &input);
-        out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
-        out.write_all(boxed("teh", 3).as_bytes()).expect("redraw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("draw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("redraw");
 
         assert!(out.out.ends_with(UNDERLINED), "{:?}", painted(&out));
     }
@@ -968,8 +970,8 @@ mod tests {
         // Held at the start of the line, not at the end of the flagged word:
         // there the underline ends where the cursor already is, and a paint
         // that never put it back would look like one that did.
-        out.write_all(boxed("teh", 0).as_bytes()).expect("draw");
-        out.write_all(boxed("teh", 0).as_bytes()).expect("redraw");
+        out.write_all(boxed("a teh", 0).as_bytes()).expect("draw");
+        out.write_all(boxed("a teh", 0).as_bytes()).expect("redraw");
         assert!(painted(&out).contains("\x1b[4:3m"), "nothing was painted");
 
         let replay = |bytes: &[u8]| {
@@ -977,7 +979,7 @@ mod tests {
             Parser::new().advance(&mut terminal, bytes);
             terminal.look().cursor
         };
-        let unwrapped = boxed("teh", 0).repeat(2);
+        let unwrapped = boxed("a teh", 0).repeat(2);
 
         assert_eq!(replay(&out.out), replay(unwrapped.as_bytes()));
     }
@@ -989,7 +991,7 @@ mod tests {
     #[test]
     fn a_line_nothing_redraws_is_painted_when_the_wait_runs_out() {
         let mut out = fake(&["teh"]);
-        out.write_all(boxed("teh", 3).as_bytes()).expect("draw");
+        out.write_all(boxed("teh ", 4).as_bytes()).expect("draw");
         assert!(!out.out.ends_with(UNDERLINED), "painted a changed line");
         assert!(out.wake_in().is_some(), "nothing left to wait for");
         out.tick();
@@ -1018,11 +1020,11 @@ mod tests {
     #[test]
     fn a_word_after_a_wrap_is_underlined_where_the_box_wrapped_it() {
         let input = shared_input();
-        typed(&input, b"one teh");
+        typed(&input, b"one teh ");
         let mut out = harper(&input);
-        out.write_all(wrapped("one", "teh", (2, 5)).as_bytes())
+        out.write_all(wrapped("one", "teh ", (2, 6)).as_bytes())
             .expect("draw");
-        out.write_all(wrapped("one", "teh", (2, 5)).as_bytes())
+        out.write_all(wrapped("one", "teh ", (2, 6)).as_bytes())
             .expect("redraw");
         let painted = painted(&out);
         assert!(

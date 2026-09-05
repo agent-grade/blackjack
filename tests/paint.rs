@@ -72,11 +72,45 @@ fn the_log_of_a_painting_session_says_what_it_did() {
     );
 }
 
+/// The same box a keystroke later: the last character of the line replaced,
+/// and the cells the underline is standing on left untouched — which is how
+/// Claude Code redraws, and why nothing but the wrapper will ever take that
+/// underline off.
+const EDITED_BOX: &str = "\\033[?2026h\\033[2;12H\\033[Ks\\033[2;14H\\033[?2026l";
+/// The underline coming off: the cells re-written where they stand with the
+/// attribute turned back off.
+const CLEARED: &str = "\x1b[2;5H\x1b[59m\x1b[24mteh";
+
+/// The line changes and the underline that belonged to it comes off in the
+/// same write. The program redraws only the cells a keystroke changed, so an
+/// underline over the cells it leaves alone outlives the line it was about
+/// until this wrapper takes it off itself.
+#[test]
+fn the_underline_comes_off_when_the_line_it_belongs_to_changes() {
+    let script = format!("printf '{FAKE_BOX}'; sleep {SILENCE}; printf '{EDITED_BOX}'; sleep 3");
+    let (seen, logged) = run_script(false, &script, "unpaint");
+
+    let underlined = seen.find("\x1b[4:3m").expect("nothing was underlined");
+    let cleared = seen.find(CLEARED).expect("the underline never came off");
+    assert!(cleared > underlined, "{seen:?}");
+    assert!(logged.contains("unpaint "), "{logged}");
+}
+
 /// Everything the terminal saw and everything the wrapper wrote down about it,
 /// with the wrapper reaped once its output ended.
 fn run_wrapped(paint_off: bool) -> (String, String) {
-    let log =
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("paint-{paint_off}.log"));
+    run_script(
+        paint_off,
+        &format!("printf '{FAKE_BOX}'; sleep {SILENCE}"),
+        &format!("paint-{paint_off}"),
+    )
+}
+
+/// The same session over a script of one's own, so a test can put a second
+/// frame on the screen and watch what the wrapper does with the first one's
+/// underline.
+fn run_script(paint_off: bool, script: &str, named: &str) -> (String, String) {
+    let log = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{named}.log"));
     let _ = std::fs::remove_file(&log);
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -87,8 +121,7 @@ fn run_wrapped(paint_off: bool) -> (String, String) {
         })
         .expect("outer pty");
     let mut wrapped = CommandBuilder::new(env!("CARGO_BIN_EXE_blackjack"));
-    let script = format!("printf '{FAKE_BOX}'; sleep {SILENCE}");
-    wrapped.args(["--", "sh", "-c", &script]);
+    wrapped.args(["--", "sh", "-c", script]);
     wrapped.env("BLACKJACK_DEBUG_LOG", &log);
     // Inherited otherwise, which would hand the wrapper the kill switch and
     // have the painting test pass by never painting.

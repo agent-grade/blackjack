@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::checker::{Checker, Flag, worded};
 use crate::log::Log;
@@ -41,6 +41,14 @@ pub struct Painter {
     /// on every check, so a word learned now stops being underlined at the next
     /// frame instead of the next time the line is asked about.
     learned: SharedLearned,
+    /// The runs this painter last drew. The program redraws only the cells a
+    /// keystroke changed, so an underline over cells it does not touch stays
+    /// on the terminal until this painter takes it off itself.
+    painted: Vec<Run>,
+    /// And the ones the box was not showing when they were due to come off,
+    /// kept for one frame in case the frame that shows them is the next one.
+    /// Two frames without them and the program has redrawn those cells itself.
+    missing: Vec<Run>,
 }
 
 impl Painter {
@@ -71,6 +79,8 @@ impl Painter {
             checked,
             log,
             learned,
+            painted: Vec::new(),
+            missing: Vec::new(),
         }
     }
 
@@ -91,6 +101,13 @@ impl Painter {
             // a line nothing can paint.
             self.line.clear();
             self.flags = None;
+            // Nothing can be taken off a screen this painter can no longer
+            // read: the coordinates of what it drew mean nothing against
+            // whatever is there now. A box that comes back is read again from
+            // scratch, and what is still flagged is painted again over the
+            // same cells.
+            self.painted.clear();
+            self.missing.clear();
             return self.refused("no box");
         };
         if self.checker.is_none() {
@@ -100,7 +117,10 @@ impl Painter {
             self.line.clone_from(&line.text);
             self.changed = Instant::now();
             self.flags = None;
-            return self.refused("line changed");
+            // The underlines belonged to the line that just went. They come
+            // off in the same write as the frame that replaced it, or the
+            // user reads them as belonging to what they are typing now.
+            return self.unpaint(line, look, "line changed");
         }
         if self.flags.is_none() {
             if self.changed.elapsed() < self.pause {
@@ -129,11 +149,12 @@ impl Painter {
             .iter()
             .flatten()
             .filter(|flag| !learned.contains(&worded(&line.text, &flag.span)))
+            .filter(|flag| !being_typed(line, &flag.span))
             .flat_map(|flag| runs_of(line, &flag.span))
             .collect();
         drop(learned);
         if runs.is_empty() {
-            return self.refused("nothing to underline");
+            return self.unpaint(line, look, "nothing to underline");
         }
         // The two states nothing may be written in, and the reason they are
         // tested here rather than on the way in: both are about the bytes, not
@@ -151,19 +172,72 @@ impl Painter {
         if look.wrap_pending {
             return self.refused("wrap pending");
         }
-        let paint = draw(&runs, look);
+        let off = self.stale(line, &runs);
+        let paint = draw(&off, &runs, look);
+        self.remember(line, runs.clone());
         if self.log.is_on() {
-            let places: Vec<String> = runs
-                .iter()
-                .map(|run| format!("{},{}", run.row, run.col))
-                .collect();
             self.log.line(format_args!(
                 "paint {}B at [{}]",
                 paint.len(),
-                places.join(" ")
+                placed(&runs)
             ));
         }
         Some(paint)
+    }
+
+    /// The underlines standing on the screen with nothing left to justify
+    /// them, taken off in this frame. A frame that may not be written in keeps
+    /// them for the next one — a stale underline is worth less than a frame
+    /// presented half-drawn.
+    fn unpaint(&mut self, line: &Line, look: &Look, reason: &str) -> Option<Vec<u8>> {
+        if self.painted.is_empty() {
+            return self.refused(reason);
+        }
+        if look.mid_frame || look.wrap_pending {
+            return self.refused(reason);
+        }
+        let off = self.stale(line, &[]);
+        self.remember(line, Vec::new());
+        if off.is_empty() {
+            return self.refused(reason);
+        }
+        let paint = draw(&off, &[], look);
+        if self.log.is_on() {
+            self.log.line(format_args!(
+                "unpaint {}B at [{}]: {reason}",
+                paint.len(),
+                placed(&off)
+            ));
+        }
+        Some(paint)
+    }
+
+    /// The runs to take off: what was drawn last time and is not being drawn
+    /// now, re-read where the box is showing those cells today rather than
+    /// trusted from when they were drawn.
+    fn stale(&self, line: &Line, keeping: &[Run]) -> Vec<Run> {
+        self.painted
+            .iter()
+            .filter(|run| !keeping.contains(run))
+            .flat_map(|run| now_at(line, run))
+            .collect()
+    }
+
+    /// What is on the terminal after this frame: what was just drawn, and what
+    /// was due to come off and could not be found. A run the box has not shown
+    /// for two frames running is one the program has drawn over itself, and
+    /// keeping it would cost a scan of the line every frame for good.
+    fn remember(&mut self, line: &Line, drawn: Vec<Run>) {
+        let missed: Vec<Run> = self
+            .painted
+            .iter()
+            .filter(|run| !drawn.contains(run) && now_at(line, run).is_empty())
+            .filter(|run| !self.missing.contains(run))
+            .cloned()
+            .collect();
+        self.painted = drawn;
+        self.painted.extend(missed.iter().cloned());
+        self.missing = missed;
     }
 
     /// Nothing painted, and why. Every path out of `paint` that draws nothing
@@ -219,6 +293,14 @@ impl Painter {
     }
 }
 
+/// Where a log line says the runs landed.
+fn placed(runs: &[Run]) -> String {
+    runs.iter()
+        .map(|run| format!("{},{}", run.row, run.col))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Spans as a log line lists them.
 fn spanned(flags: &[Flag]) -> String {
     flags
@@ -231,6 +313,7 @@ fn spanned(flags: &[Flag]) -> String {
 /// A flagged stretch of the line as it can actually be drawn: the characters
 /// standing next to each other on one row, at the column the first of them
 /// sits in.
+#[derive(Clone, PartialEq, Eq)]
 struct Run {
     row: usize,
     col: usize,
@@ -267,6 +350,57 @@ fn runs_of(line: &Line, span: &Range<usize>) -> Vec<Run> {
     runs
 }
 
+/// A word the user is still inside is not a mistake yet: the cursor in it, or
+/// at its end with nothing but more of the word to come, means they have not
+/// finished saying it. Every fragment of a long word would otherwise be
+/// underlined on the way past.
+fn being_typed(line: &Line, span: &Range<usize>) -> bool {
+    if line.cursor <= span.start || line.cursor > span.end {
+        return false;
+    }
+    line.cursor < span.end
+        || line
+            .text
+            .chars()
+            .nth(line.cursor)
+            .is_none_or(|next| next.is_alphanumeric())
+}
+
+/// The cells a run covers, as the box is showing them now. What was drawn over
+/// them is no guide: by the time an underline has to come off, the program may
+/// have written something else there, and the line the box shows is the only
+/// account of that this painter is given.
+fn now_at(line: &Line, run: &Run) -> Vec<Run> {
+    let mut found: Vec<Run> = Vec::new();
+    let mut after = None;
+    for (at, character) in line.text.chars().enumerate() {
+        let Some((row, spot)) = line.spots.get(at).copied().flatten() else {
+            continue;
+        };
+        let width = character.width().unwrap_or(1);
+        let inside =
+            row == run.row && spot >= run.col && spot + width <= run.col + run.text.width();
+        // A blank is the box's own padding, or the placeholder the model reads
+        // as one. Writing a space back over either would be this painter
+        // drawing rather than undrawing, so the cell is left alone — and a
+        // doubled word, which is one flag over two words with a space between
+        // them, comes off in the two pieces the box is showing.
+        if !inside || character == ' ' {
+            continue;
+        }
+        match found.last_mut() {
+            Some(run) if after == Some(spot) => run.text.push(character),
+            _ => found.push(Run {
+                row,
+                col: spot,
+                text: character.to_string(),
+            }),
+        }
+        after = Some(spot + width);
+    }
+    found
+}
+
 /// A frame of its own, so the terminal shows the underlines in one update
 /// rather than a cursor jumping about. The cursor is put back by moving it
 /// rather than by `ESC 7`/`ESC 8`: a terminal keeps one saved cursor per screen
@@ -279,12 +413,20 @@ fn runs_of(line: &Line, span: &Range<usize>) -> Vec<Run> {
 /// in the wrong one. Against the program this wrapper is for it is a
 /// formality either way, since neither capture has a single frame closing with
 /// any attribute set at all.
-fn draw(runs: &[Run], look: &Look) -> Vec<u8> {
+fn draw(off: &[Run], on: &[Run], look: &Look) -> Vec<u8> {
     let mut paint = String::from("\x1b[?2026h");
     if look.dimmed {
         paint += "\x1b[22m";
     }
-    for run in runs {
+    for run in off {
+        paint += &format!(
+            "\x1b[{};{}H\x1b[59m\x1b[24m{}",
+            run.row + 1,
+            run.col + 1,
+            run.text
+        );
+    }
+    for run in on {
         paint += &format!(
             "\x1b[{};{}H\x1b[4:3m\x1b[58:2::255:0:0m{}\x1b[59m\x1b[24m",
             run.row + 1,
@@ -517,10 +659,14 @@ mod tests {
         );
         assert!(ask(&mut painter, &drawn).is_some());
         let fixed = box_holding("a the word");
+        // The frame that changed the line carries the underline off it.
+        let taken_off = ask(&mut painter, &fixed).expect("the underline taken off");
+        let taken_off = String::from_utf8(taken_off).expect("utf8");
         assert!(
-            ask(&mut painter, &fixed).is_none(),
-            "painted the change itself"
+            taken_off.contains("\x1b[2;5H\x1b[59m\x1b[24mthe"),
+            "the cells were not written back where they stand: {taken_off:?}"
         );
+        assert!(!taken_off.contains("\x1b[4:3m"), "{taken_off:?}");
         assert!(ask(&mut painter, &fixed).is_none(), "painted the old flags");
     }
 
@@ -656,13 +802,143 @@ mod tests {
         let quiet = paint_of(&mut Painter::checking(engine()), &box_holding("src/pty.rs"));
         let flagged = paint_of(
             &mut Painter::checking(engine()),
-            &box_holding("src/pty.rs teh"),
+            &box_holding("teh src/pty.rs"),
         );
 
         assert!(quiet.is_none(), "underlined a path: {quiet:?}");
         let flagged = flagged.expect("the misspelling beside it");
         assert!(flagged.contains("teh"), "{flagged:?}");
         assert!(!flagged.contains("src"), "{flagged:?}");
+    }
+
+    /// A long word is a run of misspellings on the way to being one word, and
+    /// underlining each fragment as it goes is the wrapper talking over the
+    /// user. Nothing is said about the word until they have finished saying it.
+    #[test]
+    fn the_word_under_the_cursor_is_left_alone_until_it_is_finished() {
+        let mut typing = checking(&["teh"]);
+        assert!(
+            paint_of(&mut typing, &box_holding("teh")).is_none(),
+            "underlined a word still being typed"
+        );
+
+        let mut finished = checking(&["teh"]);
+        let painted = paint_of(&mut finished, &box_holding("teh word")).expect("a paint");
+        assert!(painted.contains("teh"), "{painted:?}");
+    }
+
+    /// A misspelling at the very start of the line, with the program holding
+    /// its cursor above the box: the cursor is at the line's first character
+    /// and the word is not being typed — it is sitting there whole.
+    #[test]
+    fn a_word_the_cursor_sits_in_front_of_is_underlined() {
+        let mut screen = Screen::new(20, 3);
+        let drawn = "\x1b[?2026h\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}teh word\r\n\u{2500}\u{2500}\u{2500}\x1b[1;1H\x1b[?2026l";
+        crate::parser::Parser::new().advance(&mut screen, drawn.as_bytes());
+        let painted = paint_of(&mut checking(&["teh"]), &screen).expect("a paint");
+        assert!(painted.contains("teh"), "{painted:?}");
+    }
+
+    /// Taking an underline off means writing the box's own characters back
+    /// where they stand. A blank is not one of those: it is the box's padding,
+    /// or the placeholder the model reads as blank, and a space written there
+    /// is this painter drawing over the program.
+    #[test]
+    fn a_cell_the_box_left_blank_is_not_written_back_over() {
+        let mut painter = checking(&["teh"]);
+        assert!(paint_of(&mut painter, &box_holding("a teh word")).is_some());
+        let blanked = box_holding("a     word");
+        assert_eq!(
+            ask(&mut painter, &blanked).map(|paint| String::from_utf8_lossy(&paint).into_owned()),
+            None,
+            "wrote over cells the box is holding blank"
+        );
+    }
+
+    /// And an underline whose cells the box is not showing has not come off:
+    /// the frame that can be read is the one that takes it away, however many
+    /// frames later that is.
+    #[test]
+    fn an_underline_that_could_not_be_found_comes_off_later() {
+        let mut painter = checking(&["teh"]);
+        assert!(paint_of(&mut painter, &box_holding("a teh word")).is_some());
+        assert!(ask(&mut painter, &box_holding("a     word")).is_none());
+
+        let showing = box_holding("a the word");
+        let taken_off = ask(&mut painter, &showing).expect("the underline taken off");
+        assert!(
+            String::from_utf8_lossy(&taken_off).contains("\x1b[2;5H\x1b[59m\x1b[24mthe"),
+            "{taken_off:?}"
+        );
+    }
+
+    /// A doubled word is one flag over two words with a space between them.
+    /// The space is the box's own cell, so the underline comes off in the two
+    /// pieces it was drawn in — both of them, or the second word keeps its
+    /// underline for the rest of the session.
+    #[test]
+    fn a_doubled_word_comes_off_in_both_of_its_pieces() {
+        let learned = SharedLearned::default();
+        let (mut painter, _) = spanning(0..7);
+        painter.learned = learned.clone();
+        let drawn = box_holding("the the cat");
+        assert!(paint_of(&mut painter, &drawn).is_some(), "never underlined");
+
+        learned
+            .lock()
+            .expect("learned")
+            .insert("the the".to_string());
+        let taken_off =
+            String::from_utf8_lossy(&ask(&mut painter, &drawn).expect("taken off")).into_owned();
+        assert!(
+            taken_off.contains("\x1b[2;3H\x1b[59m\x1b[24mthe"),
+            "{taken_off:?}"
+        );
+        assert!(
+            taken_off.contains("\x1b[2;7H\x1b[59m\x1b[24mthe"),
+            "the second word kept its underline: {taken_off:?}"
+        );
+    }
+
+    /// The word being typed, at each of the places the cursor can be in and
+    /// around it: the rule is about the word the user is still saying, and the
+    /// character after the cursor is what says whether they are.
+    #[test]
+    fn the_cursor_at_each_edge_of_a_word_says_whether_it_is_finished() {
+        let held = |text: &str, cursor: usize| {
+            let line = Line {
+                text: text.to_string(),
+                cursor,
+                spots: Vec::new(),
+            };
+            being_typed(&line, &(2..5))
+        };
+
+        assert!(!held("a teh", 2), "the cursor is in front of the word");
+        assert!(held("a teh", 3), "the cursor is inside the word");
+        assert!(held("a teh", 5), "the word ends where the typing stopped");
+        assert!(held("a tehx", 5), "more of the word follows the cursor");
+        assert!(!held("a teh word", 5), "the word is finished and spaced");
+        assert!(!held("a teh, x", 5), "the word is finished and punctuated");
+        assert!(!held("a teh word", 10), "the cursor has moved on");
+    }
+
+    /// And the fix chord is not held back with it: the word is published to the
+    /// keystroke side either way, so the moment the cursor leaves the word the
+    /// chord has something to claim without waiting for another frame.
+    #[test]
+    fn a_word_held_back_from_the_paint_is_still_offered_to_the_chord() {
+        let checked = SharedChecked::default();
+        let mut painter = checking(&["teh"]);
+        painter.checked = checked.clone();
+        assert!(
+            paint_of(&mut painter, &box_holding("teh")).is_none(),
+            "underlined a word still being typed"
+        );
+
+        let published = checked.lock().expect("checked");
+        assert_eq!(published.line, "teh");
+        assert_eq!(published.flags.len(), 1);
     }
 
     /// A checker reads the filter's blanks as ordinary space, so it can report
@@ -714,6 +990,13 @@ mod tests {
 
         learned.lock().expect("learned").insert("teh".to_string());
 
+        let taken_off =
+            String::from_utf8_lossy(&ask(&mut painter, &drawn).expect("taken off")).into_owned();
+        assert!(
+            taken_off.contains("\x1b[2;5H\x1b[59m\x1b[24mteh"),
+            "the learned word was not written back plain: {taken_off:?}"
+        );
+        assert!(!taken_off.contains("\x1b[4:3m"), "{taken_off:?}");
         assert!(ask(&mut painter, &drawn).is_none());
     }
 
@@ -740,7 +1023,7 @@ mod tests {
     #[test]
     fn a_flag_the_box_broke_across_rows_is_drawn_on_each() {
         let mut screen = Screen::new(8, 4);
-        let drawn = "\x1b[?2026h\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}abcdef\r\n  ghij\r\n\u{2500}\u{2500}\u{2500}\x1b[3;7H\x1b[?2026l";
+        let drawn = "\x1b[?2026h\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}abcdef\r\n  ghij\r\n\u{2500}\u{2500}\u{2500}\x1b[3;8H\x1b[?2026l";
         crate::parser::Parser::new().advance(&mut screen, drawn.as_bytes());
         let (mut painter, _) = spanning(0..11);
         let paint = paint_of(&mut painter, &screen).expect("a paint");
