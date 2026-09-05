@@ -245,12 +245,22 @@ impl Screen {
     }
 
     /// A row drawn as an edge of the box — which a row of untouched blanks,
-    /// holding no border character at all, is not. Both captures draw both
-    /// edges as unbroken runs with no corner pieces, so a box that grew corners
-    /// would not be found at all rather than found wrongly.
+    /// holding no border character at all, is not. In a project folder the top
+    /// edge carries the folder's name, so an edge is a run the label
+    /// interrupts rather than an unbroken one: it opens and closes with the
+    /// border character and is mostly made of it.
     fn is_border(&self, row: usize) -> bool {
         let cells = &self.cells[row * self.cols..(row + 1) * self.cols];
-        cells.contains(&BORDER) && cells.iter().all(|&cell| cell == BORDER || cell == ' ')
+        let inked = |cell: &&char| **cell != ' ';
+        let Some(&first) = cells.iter().find(inked) else {
+            return false;
+        };
+        let Some(&last) = cells.iter().rfind(inked) else {
+            return false;
+        };
+        let borders = cells.iter().filter(|&&cell| cell == BORDER).count();
+        let written = cells.iter().filter(inked).count();
+        first == BORDER && last == BORDER && borders * 2 > written
     }
 
     /// One column past the last one a row holds anything in. A dim cell holds
@@ -1123,6 +1133,30 @@ mod tests {
             20,
             3,
             "\u{2500}\u{2500}\u{2500}\r\n\u{276f}\u{a0}typed\r\nmode line".as_bytes(),
+        );
+        assert_eq!(input_row(&screen), None);
+    }
+
+    /// In a project folder Claude Code writes the folder's name into the top
+    /// edge, which is the shape the wrapper meets everywhere it is meant to
+    /// run — and the shape neither capture was taken in.
+    #[test]
+    fn an_edge_carrying_the_folder_name_still_bounds_the_box() {
+        let edge = "\u{2500}".repeat(24);
+        let drawn = edge.clone() + " blackjack \u{2500}\r\n\u{276f}\u{a0}teh\r\n" + &edge;
+        let screen = screen(40, 3, drawn.as_bytes());
+        assert_eq!(input_row(&screen), Some(("teh".to_string(), 3)));
+    }
+
+    /// The label costs the edge its purity, so what is left to tell an edge
+    /// from a line of prose that happens to hold the character is where the
+    /// character sits and how much of the row it is.
+    #[test]
+    fn a_line_of_prose_holding_the_character_is_not_an_edge() {
+        let screen = screen(
+            40,
+            3,
+            "a \u{2500} and another \u{2500} in prose\r\n\u{276f}\u{a0}teh\r\n\u{2500}\u{2500}\u{2500}".as_bytes(),
         );
         assert_eq!(input_row(&screen), None);
     }
