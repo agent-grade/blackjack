@@ -244,23 +244,27 @@ impl Screen {
         self.cols > PROMPT.len() && self.cells[at..at + PROMPT.len()] == PROMPT
     }
 
-    /// A row drawn as an edge of the box — which a row of untouched blanks,
-    /// holding no border character at all, is not. In a project folder the top
-    /// edge carries the folder's name, so an edge is a run the label
-    /// interrupts rather than an unbroken one: it opens and closes with the
-    /// border character and is mostly made of it.
+    /// A row drawn as an edge of the box. In a project folder Claude Code
+    /// writes the session's name into the top edge, so an edge is a rule the
+    /// name interrupts once — it opens and closes with the border character
+    /// and is broken at most in one place. A row of untouched blanks holds no
+    /// such rule, and neither does a line of prose that happens to carry the
+    /// character: a shape this does not know is not found at all rather than
+    /// found wrongly.
     fn is_border(&self, row: usize) -> bool {
         let cells = &self.cells[row * self.cols..(row + 1) * self.cols];
-        let inked = |cell: &&char| **cell != ' ';
-        let Some(&first) = cells.iter().find(inked) else {
+        let (Some(from), Some(to)) = (
+            cells.iter().position(|&cell| cell != ' '),
+            cells.iter().rposition(|&cell| cell != ' '),
+        ) else {
             return false;
         };
-        let Some(&last) = cells.iter().rfind(inked) else {
-            return false;
-        };
-        let borders = cells.iter().filter(|&&cell| cell == BORDER).count();
-        let written = cells.iter().filter(inked).count();
-        first == BORDER && last == BORDER && borders * 2 > written
+        let rule = &cells[from..=to];
+        let breaks = rule
+            .split(|&cell| cell == BORDER)
+            .filter(|stretch| !stretch.is_empty())
+            .count();
+        rule[0] == BORDER && rule[rule.len() - 1] == BORDER && breaks <= 1
     }
 
     /// One column past the last one a row holds anything in. A dim cell holds
@@ -955,6 +959,39 @@ mod tests {
         lines
     }
 
+    /// A capture taken where the wrapper is meant to run: a session with a name,
+    /// which Claude Code writes into the top edge of the box. Both other
+    /// captures were taken in a folder that gave the session none, so the edge
+    /// they hold is unbroken and the shape that mattered was never in the tree.
+    #[test]
+    fn a_captured_edge_carrying_the_session_name_still_bounds_the_box() {
+        let mut screen = Screen::new(104, 61);
+        let mut parser = crate::parser::Parser::new();
+        let capture = include_bytes!("../tests/fixtures/claude-labelled-edge-61x104.bin");
+        let (mut frames, mut lines) = (0, Vec::new());
+        for byte in capture.iter() {
+            parser.advance(&mut screen, &[*byte]);
+            if screen.frames() != frames {
+                frames = screen.frames();
+                if let Some((line, cursor)) =
+                    input_row(&screen).filter(|(line, _)| !line.is_empty())
+                {
+                    lines.push((line, cursor));
+                }
+            }
+        }
+        assert!(
+            screen.line(56).contains(" sample "),
+            "the capture no longer holds a named edge: {:?}",
+            screen.line(56)
+        );
+        assert_eq!(
+            lines.first().map(|(line, cursor)| (line.as_str(), *cursor)),
+            Some(("teh mesage", 10)),
+            "the box was never read through the named edge"
+        );
+    }
+
     /// The captured session typed a line, went back two characters, and put a
     /// phrase with two double-width characters in at that point — so the last
     /// frame holding anything carries the tail of the first past the insertion.
@@ -1143,16 +1180,57 @@ mod tests {
     #[test]
     fn an_edge_carrying_the_folder_name_still_bounds_the_box() {
         let edge = "\u{2500}".repeat(24);
-        let drawn = edge.clone() + " blackjack \u{2500}\r\n\u{276f}\u{a0}teh\r\n" + &edge;
+        let drawn = format!("{edge} blackjack \u{2500}\r\n\u{276f}\u{a0}teh\r\n{edge}");
         let screen = screen(40, 3, drawn.as_bytes());
         assert_eq!(input_row(&screen), Some(("teh".to_string(), 3)));
     }
 
-    /// The label costs the edge its purity, so what is left to tell an edge
-    /// from a line of prose that happens to hold the character is where the
-    /// character sits and how much of the row it is.
+    /// A long name in a narrow pane leaves less of the rule than of the name,
+    /// and the box is no less a box for it — a measure of how much border is
+    /// left would lose it exactly where the terminal is smallest.
     #[test]
-    fn a_line_of_prose_holding_the_character_is_not_an_edge() {
+    fn an_edge_is_an_edge_however_much_of_it_the_name_takes() {
+        let edge = "\u{2500}\u{2500}\u{2500} a rather long session name \u{2500}";
+        let drawn = edge.to_string() + "\r\n\u{276f}\u{a0}teh\r\n" + edge;
+        let screen = screen(40, 3, drawn.as_bytes());
+        assert_eq!(input_row(&screen), Some(("teh".into(), 3)));
+    }
+
+    /// An edge opens and closes with the character. A row that runs out into
+    /// words, or arrives out of them, is prose that happens to hold a stretch
+    /// of the character — the box is not bounded by either.
+    #[test]
+    fn a_rule_has_to_open_and_close_with_the_character() {
+        let above = |edge: &str| {
+            let drawn = edge.to_string() + "\r\n\u{276f}\u{a0}teh\r\n\u{2500}\u{2500}\u{2500}";
+            input_row(&screen(40, 3, drawn.as_bytes()))
+        };
+        assert_eq!(
+            above("\u{2500}\u{2500}\u{2500}\u{2500} and then some words"),
+            None
+        );
+        assert_eq!(
+            above("some words and then \u{2500}\u{2500}\u{2500}\u{2500}"),
+            None
+        );
+    }
+
+    /// Two interruptions are not a rule with a name in it. A table's separator
+    /// row, or a line of prose spaced out with the character, is the program's
+    /// own drawing and says nothing about where the box is.
+    #[test]
+    fn a_rule_broken_more_than_once_is_not_an_edge() {
+        let edge = "\u{2500}\u{2500} one \u{2500}\u{2500} two \u{2500}\u{2500}";
+        let drawn = edge.to_string() + "\r\n\u{276f}\u{a0}teh\r\n" + edge;
+        let screen = screen(40, 3, drawn.as_bytes());
+        assert_eq!(input_row(&screen), None);
+    }
+
+    /// The name costs the edge its purity, so what is left to tell an edge from
+    /// a line of prose that happens to hold the character is where the
+    /// character sits and how little else interrupts it.
+    #[test]
+    fn a_line_of_prose_holding_the_character_is_not_read_as_a_box() {
         let screen = screen(
             40,
             3,
