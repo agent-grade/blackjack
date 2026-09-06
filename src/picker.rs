@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::checker::{Class, Edit, Flag};
-use crate::input::{ALT, CTRL, SHIFT};
+use crate::input::{ALT, CTRL, SHIFT, SUPER};
 
 /// The key that fixes the word under the cursor, as the user writes it in the
 /// config: the modifiers held down, joined by `+`, and then the character.
@@ -25,7 +25,12 @@ pub struct Chord {
 /// actually live rather than which one the file asked for.
 impl std::fmt::Display for Chord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (bit, name) in [(SHIFT, "shift"), (ALT, "alt"), (CTRL, "ctrl")] {
+        for (bit, name) in [
+            (SHIFT, "shift"),
+            (ALT, "alt"),
+            (CTRL, "ctrl"),
+            (SUPER, "cmd"),
+        ] {
             if self.modifiers & bit != 0 {
                 write!(f, "{name}+")?;
             }
@@ -35,7 +40,7 @@ impl std::fmt::Display for Chord {
 }
 
 impl Chord {
-    /// `ctrl+.`, `alt+shift+x`. The key is the last character written, which
+    /// `ctrl+.`, `cmd+.`, `alt+shift+x`. The key is the last character written, which
     /// is what lets `+` itself be the key; whatever comes before it names the
     /// modifiers, and there has to be one — a key with none would swallow that
     /// character every time the user typed it. An unknown modifier, a missing
@@ -51,6 +56,7 @@ impl Chord {
                 "shift" => SHIFT,
                 "alt" | "opt" | "option" | "meta" => ALT,
                 "ctrl" | "control" => CTRL,
+                "cmd" | "command" | "super" | "win" => SUPER,
                 _ => return None,
             };
         }
@@ -71,6 +77,10 @@ impl Chord {
     /// configured, on such a terminal the fix key is their character with alt.
     /// A chord like `ctrl+.` has no character of its own in ASCII, so without
     /// this there would be nothing to press at all.
+    ///
+    /// `cmd` is the one modifier no terminal sends of its own accord — it
+    /// belongs to the application — so a chord holding it answers to the kitty
+    /// form only, from a terminal the user has bound to send it.
     pub fn matches(&self, keys: &[u8]) -> bool {
         let kitty = format!("\x1b[{};{}u", self.character as u32, self.modifiers + 1);
         if keys == kitty.as_bytes() {
@@ -552,6 +562,27 @@ mod tests {
 
     /// Pressing it again on a word already known has nothing to do, so the
     /// keystroke belongs to the wrapped program after all.
+    /// The command key, which the config can now name. It is the one modifier
+    /// no terminal sends unasked, so the kitty form is what a terminal bound to
+    /// send it produces — and the escape-prefixed fallback still answers, as it
+    /// does for every chord, since a terminal that cannot say which modifier
+    /// was held is exactly the one that has nothing else to offer.
+    #[test]
+    fn the_command_key_is_a_chord_the_config_can_name() {
+        let chord = Chord::parse("cmd+.").expect("a chord");
+
+        assert_eq!(chord.to_string(), "cmd+.");
+        assert!(chord.matches(b"\x1b[46;9u"), "the kitty form of cmd+.");
+        assert!(
+            !chord.matches(b"\x1b[46;5u"),
+            "that is ctrl+., a different key"
+        );
+        assert!(
+            chord.matches(b"\x1b."),
+            "the fallback answers for any chord"
+        );
+    }
+
     #[test]
     fn learning_a_word_twice_is_a_keystroke_the_program_gets() {
         let (mut picker, _, words) = learning(

@@ -13,6 +13,10 @@ const NONE: u16 = 0;
 pub const SHIFT: u16 = 0b1;
 pub const ALT: u16 = 0b10;
 pub const CTRL: u16 = 0b100;
+/// The command key on a mac. No terminal sends it of its own accord — it
+/// belongs to the application — so a key held with it arrives only where the
+/// user has bound it to say so, which the kitty numbering can.
+pub const SUPER: u16 = 0b1000;
 /// Caps lock and num lock ride in the modifier field beside the keys held down,
 /// so a latched lock would otherwise make every key a combination none of the
 /// tables below name.
