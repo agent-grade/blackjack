@@ -132,11 +132,11 @@ impl Painter {
             let Some(checker) = self.checker.as_mut() else {
                 return self.refused("no checker yet");
             };
-            let asked = prose::blanked(&line.text);
+            let asked = prose::filtered(&line.text);
             let (flags, across): (Vec<_>, Vec<_>) = checker
                 .check(&asked)
                 .into_iter()
-                .partition(|flag| prose::intact(&line.text, &asked, &flag.span));
+                .partition(|flag| prose::intact(&line.text, &flag.span));
             self.checked(&line.text, &flags, &across);
             self.publish(&line.text, &flags);
             self.flags = Some(flags);
@@ -811,6 +811,23 @@ mod tests {
         assert!(!flagged.contains("src"), "{flagged:?}");
     }
 
+    /// What the filter fills a hole with is not the user's text, so a flag
+    /// standing over it is declined before it can be shown — and with it the
+    /// fix chord and the word list, which are handed the flags this publishes.
+    /// A checker that flags the filling is the only way to ask: the real engine
+    /// has no opinion about it, which is exactly why it is the filler.
+    #[test]
+    fn a_flag_over_what_the_filter_filled_in_is_never_shown() {
+        let mut painter = checking(&["00000000"]);
+
+        let paint = paint_of(&mut painter, &box_holding("a src/x.rs word"));
+
+        assert!(
+            paint.is_none(),
+            "underlined the filter's own filling: {paint:?}"
+        );
+    }
+
     /// A long word is a run of misspellings on the way to being one word, and
     /// underlining each fragment as it goes is the wrapper talking over the
     /// user. Nothing is said about the word until they have finished saying it.
@@ -941,10 +958,9 @@ mod tests {
         assert_eq!(published.flags.len(), 1);
     }
 
-    /// A checker reads the filter's blanks as ordinary space, so it can report
-    /// the words either side of a removed path as neighbours. Such a flag is
-    /// about the hole, not the line, and nothing is drawn for it — while the
-    /// same words on their own are still underlined.
+    /// A flag that reaches across a hole the filter left is about the hole and
+    /// not the line, whatever put it there, and nothing is drawn for it — while
+    /// the same words on their own are still underlined.
     #[test]
     fn a_flag_reaching_across_a_removed_path_is_not_painted() {
         let drawn = box_holding("to ~/a to");

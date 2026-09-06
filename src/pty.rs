@@ -232,6 +232,10 @@ fn configured(wanted: bool, log: &Log) -> (Duration, Keys, Receiver<Box<dyn Chec
         return (Duration::ZERO, keys, std::sync::mpsc::channel().1);
     }
     let config = Config::load();
+    if let Some(warning) = config.grammar_warning() {
+        eprintln!("blackjack: {warning}");
+        log.line(format_args!("config: {warning}"));
+    }
     let keys = Keys::of(&config, xdg, home);
     let (pause, words) = (config.pause(), keys.words.clone());
     log.line(format_args!(

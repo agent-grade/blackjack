@@ -19,10 +19,9 @@ fn says_nothing_about_a_line_that_is_not_prose() {
     assert_eq!(check("src/pty.rs").1, "");
 }
 
-/// And nothing about the hole the filter leaves either. With the path taken
-/// out, a checker reads the words either side of it as neighbours and reports
-/// a doubled word that the user never typed — one the fix key would answer by
-/// deleting their path.
+/// And nothing about the hole the filter leaves either — the words either side
+/// of a path are never each other's neighbours, and a doubled word the user did
+/// type is still theirs.
 #[test]
 fn says_nothing_about_words_a_removed_path_left_next_to_each_other() {
     assert_eq!(check("compare the src/a.rs the src/b.rs").1, "");
@@ -30,6 +29,41 @@ fn says_nothing_about_words_a_removed_path_left_next_to_each_other() {
         check("the the cat sat").1.starts_with("0..7"),
         "a doubled word the user did type is still flagged"
     );
+}
+
+/// Nor about the article in front of one. The word after `a` is the word the
+/// rule is about, and where that word was a flag the filter took out, the hole
+/// is what it reads — not the next real word along, which is how a correct `a`
+/// was told to become `an` about once in twenty prompt lines.
+#[test]
+fn says_nothing_about_an_article_in_front_of_something_removed() {
+    for line in [
+        "add a --json option to the CLI",
+        "i want an --offline flag for the checker",
+        "open src/main.rs and add an --exit-code flag",
+        "is this a std::io::Error or an anyhow::Error",
+    ] {
+        assert_eq!(check(line).1, "", "for {line:?}");
+    }
+    assert!(
+        check("This is an mule.").1.contains("→ a"),
+        "an article the user did get wrong is still flagged"
+    );
+}
+
+/// A class name the user got wrong is a line on stderr rather than a setting
+/// that quietly does nothing, which a silenced class looks exactly like.
+#[test]
+fn a_grammar_class_that_does_not_exist_says_so() {
+    let home = configured("unknown-class", "grammar = [\"artikles\"]\n");
+
+    let (code, out, error) = checking("a teh word", &home);
+
+    assert_eq!(code, Some(0));
+    assert!(out.starts_with("2..5  teh"), "{out:?}");
+    assert!(error.contains("artikles"), "{error:?}");
+    assert!(error.contains("articles"), "{error:?}");
+    assert_eq!(check("a teh word").2, "", "a config with nothing wrong");
 }
 
 /// Nothing wrong and nothing typed both print nothing, and neither is a

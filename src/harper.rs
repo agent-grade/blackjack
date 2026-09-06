@@ -23,10 +23,10 @@ const CLASSES: &[(&str, &[&str])] = &[
     // typist makes most and reads over every time.
     ("repeated", &["RepeatedWords"]),
     // Two spaces where one was meant. Its subject is the gap between words,
-    // which is what the prose filter leaves wherever it takes a path out — so
-    // it is usable only because a flag reaching across a removed token is
-    // declined before anyone sees it. Measured with that in place: nothing at
-    // all on a filtered line, and a doubled space the user typed still caught.
+    // which is the one thing the prose filter must never leave behind where it
+    // takes a path out — and does not: the hole is a word. Measured on prompt
+    // lines full of paths and flags: nothing at all, and a doubled space the
+    // user typed still caught.
     ("spacing", &["Spaces", "NoFrenchSpaces"]),
     // `too` where the infinitive marker was meant.
     ("to-too", &["ToTwoToo"]),
@@ -68,7 +68,8 @@ pub struct HarperChecker {
 
 impl HarperChecker {
     /// `grammar` names the curated classes to enable; a name that is not a class
-    /// is ignored. `dict_path` is the user's own word list, if they have one.
+    /// enables nothing, and the config says so on its way past. `dict_path` is
+    /// the user's own word list, if they have one.
     pub fn new(grammar: &[String], dict_path: Option<&Path>) -> Self {
         let mut dictionary = MergedDictionary::new();
         dictionary.add_dictionary(FstDictionary::curated());
@@ -363,6 +364,30 @@ mod tests {
         assert!(words.contains_exact_word_str("DECSTBM"));
 
         fs::remove_file(&path).unwrap();
+    }
+
+    /// Nothing is read across a token the filter took out: not the article
+    /// beside it, not a word repeated either side of it, not a run of spaces
+    /// where it stood. Every line here was proven against a hole filled with
+    /// whitespace, where each of them flags — which is the whole reason a hole
+    /// is filled with something else.
+    #[test]
+    fn nothing_is_read_across_a_token_the_filter_took_out() {
+        let mut checker = checker();
+
+        for line in [
+            "add a --json option to the CLI",
+            "i want an --offline flag for the checker",
+            "open src/main.rs and add an --exit-code flag",
+            "the --flag the --flag versions",
+            "compare the src/a.rs the src/b.rs",
+            "read a `note` and an `entry`",
+        ] {
+            let asked = crate::prose::filtered(line);
+            let flags = checker.check(&asked);
+
+            assert!(flags.is_empty(), "{line:?} asked as {asked:?}: {flags:?}");
+        }
     }
 
     #[test]

@@ -70,13 +70,16 @@ fn check(text: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(warning) = config.grammar_warning() {
+        eprintln!("blackjack: {warning}");
+    }
     let words = config.words_path(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
     );
-    let asked = prose::blanked(text);
+    let asked = prose::filtered(text);
     for flag in config.checker(words.as_deref()).check(&asked) {
-        if prose::intact(text, &asked, &flag.span) {
+        if prose::intact(text, &flag.span) {
             println!("{}", flagged(text, &flag));
         }
     }

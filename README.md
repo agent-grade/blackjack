@@ -78,7 +78,7 @@ except under `--check`, which was asked about the config and says so instead.
 dict_path = "~/.config/blackjack/words.txt"
 
 # The grammar slips to flag; spelling is always on. Remove a class to
-# silence it.
+# silence it; a name that is not one of these is reported at startup.
 #   articles    a/an picked before the word was
 #   its-its     its for it's, and back
 #   lets-lets   lets for let's

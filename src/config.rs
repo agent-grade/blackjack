@@ -108,6 +108,29 @@ impl Config {
             .or_else(|| config_path(xdg, home).map(|config| config.with_file_name(WORDS)))
     }
 
+    /// What to say about a `grammar` list naming something that is not a class,
+    /// which is a mistake the file's own parser cannot make: an unknown key is
+    /// an error, and an unknown value is a silence indistinguishable from a
+    /// class the user meant to leave out. Nothing is lost by the mistake but
+    /// the class they meant, so this is a line to read and not a reason to
+    /// stop.
+    pub fn grammar_warning(&self) -> Option<String> {
+        let unknown: Vec<&str> = self
+            .grammar
+            .iter()
+            .map(String::as_str)
+            .filter(|wanted| !crate::harper::classes().any(|class| class == *wanted))
+            .collect();
+
+        (!unknown.is_empty()).then(|| {
+            format!(
+                "not a grammar class: {} (the classes are {})",
+                unknown.join(", "),
+                crate::harper::classes().collect::<Vec<_>>().join(", ")
+            )
+        })
+    }
+
     /// The configured engine, given the word list to start from — the same
     /// file a learned word is appended to, so a word taught in one session is
     /// known to the next one. The wrapper asks for a checker and never learns
@@ -191,6 +214,39 @@ mod tests {
 
     fn home() -> Option<OsString> {
         Some(OsString::from("/somewhere"))
+    }
+
+    /// A value the user got wrong is a line to read: the file parses, the
+    /// session runs, and nothing silently watches for a class that is not
+    /// there. The defaults, being every class there is, say nothing.
+    #[test]
+    fn a_grammar_class_that_does_not_exist_says_which_and_what_there_is() {
+        let mistaken = Config {
+            grammar: vec!["artikles".into(), "repeated".into()],
+            ..Config::default()
+        };
+
+        let warning = mistaken.grammar_warning().expect("a warning");
+
+        assert!(
+            warning.starts_with("not a grammar class: artikles ("),
+            "a class the user got right is named as one they got wrong: {warning:?}"
+        );
+        for class in crate::harper::classes() {
+            assert!(
+                warning.contains(class),
+                "{class} is not offered: {warning:?}"
+            );
+        }
+        assert_eq!(Config::default().grammar_warning(), None);
+        assert_eq!(
+            Config {
+                grammar: Vec::new(),
+                ..Config::default()
+            }
+            .grammar_warning(),
+            None
+        );
     }
 
     #[test]
