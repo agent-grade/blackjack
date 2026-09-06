@@ -1,8 +1,9 @@
 # blackjack
 
 A terminal spell-check overlay. `blackjack` wraps a command in a PTY and paints
-red curly underlines under misspellings and a curated set of grammar slips as
-you type — an editor's spell-check, in the terminal.
+curly underlines under misspellings and a curated set of grammar slips as you
+type — red for a word it does not know, blue for a grammar slip. An editor's
+spell-check, in the terminal.
 
 Everything runs locally: the checker is linked in-process, and nothing typed
 ever leaves the machine.
@@ -24,7 +25,8 @@ Then wrap the program you were going to run anyway:
 blackjack -- claude
 ```
 
-A misspelling is underlined a moment after you stop typing. What is not prose
+A slip is underlined a moment after you stop typing; a red one is a word you
+can teach it, a blue one is not. What is not prose
 is never checked — a path, a flag, an identifier, a version, anything between
 backticks — because in a terminal those are what you meant.
 

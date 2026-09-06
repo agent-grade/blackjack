@@ -63,8 +63,8 @@ fn the_log_of_a_painting_session_says_what_it_did() {
     assert!(logged.contains("flags [2..5]"), "{logged}");
     assert!(logged.contains("paint "), "{logged}");
     assert!(
-        logged.contains(" at [1,4]"),
-        "the underline's own row and column: {logged}"
+        logged.contains(" at [1,4 red]"),
+        "the underline's own row and column, and the colour it went down in: {logged}"
     );
     assert!(
         logged.contains("no paint: "),

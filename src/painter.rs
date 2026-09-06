@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::checker::{Checker, Flag, worded};
+use crate::checker::{Checker, Class, Flag, worded};
 use crate::log::Log;
 use crate::picker::{SharedChecked, SharedLearned};
 use crate::prose;
@@ -150,7 +150,7 @@ impl Painter {
             .flatten()
             .filter(|flag| !learned.contains(&worded(&line.text, &flag.span)))
             .filter(|flag| !being_typed(line, &flag.span))
-            .flat_map(|flag| runs_of(line, &flag.span))
+            .flat_map(|flag| runs_of(line, flag))
             .collect();
         drop(learned);
         if runs.is_empty() {
@@ -296,7 +296,7 @@ impl Painter {
 /// Where a log line says the runs landed.
 fn placed(runs: &[Run]) -> String {
     runs.iter()
-        .map(|run| format!("{},{}", run.row, run.col))
+        .map(|run| format!("{},{} {}", run.row, run.col, named(run.class)))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -310,27 +310,48 @@ fn spanned(flags: &[Flag]) -> String {
         .join(" ")
 }
 
+/// The colour a slip is underlined in, as the parameter of an underline-colour
+/// escape: red for a word the dictionary does not have, blue for a slip in the
+/// grammar. Which key answers which is what the two are for, and `Class` says
+/// that.
+fn coloured(class: Class) -> &'static str {
+    match class {
+        Class::Spelling => "58:2::255:0:0",
+        Class::Grammar => "58:2::64:156:255",
+    }
+}
+
+/// The same colour as a word, for the account of a session: it is read by
+/// someone who watched a colour appear, not by someone decoding an escape.
+fn named(class: Class) -> &'static str {
+    match class {
+        Class::Spelling => "red",
+        Class::Grammar => "blue",
+    }
+}
+
 /// A flagged stretch of the line as it can actually be drawn: the characters
 /// standing next to each other on one row, at the column the first of them
-/// sits in.
+/// sits in, in the colour the kind of slip is underlined in.
 #[derive(Clone, PartialEq, Eq)]
 struct Run {
     row: usize,
     col: usize,
     text: String,
+    class: Class,
 }
 
 /// The box may have broken a flagged stretch across two rows, and the break
 /// itself has no cell — either one ends a run and starts another.
-fn runs_of(line: &Line, span: &Range<usize>) -> Vec<Run> {
+fn runs_of(line: &Line, flag: &Flag) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     let mut after = None;
     for (at, character) in line
         .text
         .chars()
         .enumerate()
-        .take(span.end)
-        .skip(span.start)
+        .take(flag.span.end)
+        .skip(flag.span.start)
     {
         // A break has no cell of its own, and the row below is a row along:
         // whatever follows it starts a run wherever it starts.
@@ -343,6 +364,7 @@ fn runs_of(line: &Line, span: &Range<usize>) -> Vec<Run> {
                 row,
                 col,
                 text: character.to_string(),
+                class: flag.class,
             }),
         }
         after = Some((row, col + character.width().unwrap_or(1)));
@@ -394,6 +416,7 @@ fn now_at(line: &Line, run: &Run) -> Vec<Run> {
                 row,
                 col: spot,
                 text: character.to_string(),
+                class: run.class,
             }),
         }
         after = Some(spot + width);
@@ -428,9 +451,10 @@ fn draw(off: &[Run], on: &[Run], look: &Look) -> Vec<u8> {
     }
     for run in on {
         paint += &format!(
-            "\x1b[{};{}H\x1b[4:3m\x1b[58:2::255:0:0m{}\x1b[59m\x1b[24m",
+            "\x1b[{};{}H\x1b[4:3m\x1b[{}m{}\x1b[59m\x1b[24m",
             run.row + 1,
             run.col + 1,
+            coloured(run.class),
             run.text
         );
     }
@@ -825,6 +849,47 @@ mod tests {
             paint.is_none(),
             "underlined the filter's own filling: {paint:?}"
         );
+    }
+
+    /// Which colour an underline is drawn in says which kind of slip it stands
+    /// over, because the two are answered by different keys: a word the
+    /// dictionary does not have can be taught, and a slip in the grammar can
+    /// only be fixed. The line carrying one of each carries both colours.
+    #[test]
+    fn a_misspelling_is_underlined_in_red_and_a_grammar_slip_in_blue() {
+        let engine = || {
+            let classes: Vec<String> = crate::harper::classes().map(str::to_string).collect();
+            Box::new(crate::harper::HarperChecker::new(&classes, None))
+        };
+
+        let spelled = paint_of(&mut Painter::checking(engine()), &box_holding("a teh word"))
+            .expect("the misspelling");
+        let both = paint_of(
+            &mut Painter::checking(engine()),
+            &box_holding("its a teh word"),
+        )
+        .expect("one of each");
+
+        assert!(spelled.contains("\x1b[58:2::255:0:0mteh"), "{spelled:?}");
+        assert!(!spelled.contains("58:2::64:156:255"), "{spelled:?}");
+        assert!(both.contains("\x1b[58:2::64:156:255mits"), "{both:?}");
+        assert!(both.contains("\x1b[58:2::255:0:0mteh"), "{both:?}");
+    }
+
+    /// Taking an underline off is the same in either colour: the escape that
+    /// ends it names none, so this painter leaves none of its own on the pen.
+    #[test]
+    fn an_underline_comes_off_the_same_whichever_colour_it_was() {
+        let classes: Vec<String> = crate::harper::classes().map(str::to_string).collect();
+        let mut painter =
+            Painter::checking(Box::new(crate::harper::HarperChecker::new(&classes, None)));
+        assert!(paint_of(&mut painter, &box_holding("its a teh word")).is_some());
+
+        let taken_off = ask(&mut painter, &box_holding("it's a the word")).expect("both off");
+        let taken_off = String::from_utf8(taken_off).expect("utf8");
+
+        assert!(taken_off.contains("\x1b[59m\x1b[24m"), "{taken_off:?}");
+        assert!(!taken_off.contains("58:2::"), "{taken_off:?}");
     }
 
     /// A long word is a run of misspellings on the way to being one word, and
