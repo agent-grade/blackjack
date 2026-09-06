@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use harper_core::linting::{LintGroup, Suggestion};
 use harper_core::spell::{FstDictionary, MergedDictionary, MutableDictionary};
-use harper_core::{Dialect, DictWordMetadata, Document};
+use harper_core::{Dialect, DictWordMetadata, Document, InitialSound, starts_with_vowel};
 
 use crate::checker::{Checker, Class, Edit, Flag};
 
@@ -157,6 +157,9 @@ fn is_curated(rule: &str) -> bool {
 ///
 /// A rule whose fix is the gap itself stays on it — `spacing` says two spaces
 /// should be one, and there is no word to move that onto.
+///
+/// An offer whose article the word does not take is dropped: `an report` is the
+/// slip the `articles` class is for, and the overlay does not argue with itself.
 fn anchored(characters: &[char], flag: Flag) -> Option<Flag> {
     let blank = characters
         .get(flag.span.clone())
@@ -169,12 +172,17 @@ fn anchored(characters: &[char], flag: Flag) -> Option<Flag> {
         return Some(flag);
     }
     let from = flag.span.end;
+    // The word ends where the word ends: a full stop or a comma after it is
+    // punctuation the underline has no business covering.
     let to = characters
         .iter()
         .enumerate()
         .skip(from)
-        .find(|(_, c)| c.is_whitespace())
-        .map_or(characters.len(), |(at, _)| at);
+        .take_while(|(_, c)| !c.is_whitespace())
+        .filter(|(_, c)| c.is_alphanumeric())
+        .map(|(at, _)| at + 1)
+        .last()
+        .unwrap_or(from);
     if from >= to {
         return None;
     }
@@ -185,12 +193,25 @@ fn anchored(characters: &[char], flag: Flag) -> Option<Flag> {
         suggestions: flag
             .suggestions
             .into_iter()
-            .map(|edit| match edit {
-                Edit::Replace(offer) => Edit::Replace(format!("{}{word}", offer.trim_start())),
-                other => other,
+            .filter_map(|edit| match edit {
+                Edit::Replace(offer) => article_fits(offer.trim(), &word)
+                    .then(|| Edit::Replace(format!("{}{word}", offer.trim_start()))),
+                other => Some(other),
             })
             .collect(),
     })
+}
+
+/// Whether the article an offer folds in is the one that word takes. This is
+/// the very predicate harper's own article rule asks, so an offer built here
+/// can never be the slip that rule exists to catch — and a word it reads either
+/// way, like `SQL`, keeps its offer rather than losing one to a guess.
+fn article_fits(article: &str, word: &str) -> bool {
+    let sound = starts_with_vowel(&word.chars().collect::<Vec<char>>(), Dialect::American);
+    !matches!(
+        (article, sound),
+        ("a", Some(InitialSound::Vowel)) | ("an", Some(InitialSound::Consonant))
+    )
 }
 
 /// All three shapes a suggestion comes in. Read as a bare word an insertion or
@@ -460,6 +481,67 @@ mod tests {
         assert_eq!(flags.len(), 1);
         assert_eq!(flags[0].span, 5..11);
         assert_eq!(flags[0].class, Class::Grammar);
+        assert!(
+            flags[0]
+                .suggestions
+                .contains(&Edit::Replace("a report".into())),
+            "{:?}",
+            flags[0].suggestions
+        );
+    }
+
+    /// An offer the wrapper would turn round and flag is not an offer. `an
+    /// report` is the slip the `articles` class exists to catch, so the fold
+    /// drops it — and drops it by asking the engine, not by counting vowels,
+    /// which is why `an update` survives.
+    #[test]
+    fn no_offer_is_one_the_table_itself_would_flag() {
+        let mut checker = checker();
+
+        let report = checker.check("send report");
+        let update = checker.check("send update");
+
+        assert_eq!(
+            report[0].suggestions,
+            vec![
+                Edit::Replace("the report".into()),
+                Edit::Replace("a report".into())
+            ]
+        );
+        assert!(
+            update[0]
+                .suggestions
+                .contains(&Edit::Replace("an update".into())),
+            "{:?}",
+            update[0].suggestions
+        );
+    }
+
+    /// The three a rule of thumb about vowels gets wrong, which is why the
+    /// engine's own predicate answers instead: an hour sounds like a vowel, a
+    /// unique case and a user do not, whatever their first letter is.
+    #[test]
+    fn the_article_a_word_takes_is_not_a_guess_about_its_first_letter() {
+        for (article, word) in [("an", "hour"), ("a", "unique"), ("a", "user")] {
+            assert!(article_fits(article, word), "{article} {word}");
+        }
+        for (article, word) in [("a", "hour"), ("an", "unique"), ("an", "user")] {
+            assert!(!article_fits(article, word), "{article} {word}");
+        }
+        // A word read either way keeps both, rather than losing one to a guess.
+        assert!(article_fits("a", "SQL") && article_fits("an", "SQL"));
+        assert!(article_fits("the", "report") && article_fits("a", ""));
+    }
+
+    /// The word ends where the word ends. A stop after it is punctuation, and
+    /// an underline over it would be the wrapper claiming the sentence. The
+    /// span and the offer together are what put the line right: `send report.`
+    /// becomes `send a report.` and keeps its stop.
+    #[test]
+    fn the_span_stops_at_the_end_of_the_word() {
+        let flags = checker().check("send report.");
+
+        assert_eq!(flags[0].span, 5..11);
         assert!(
             flags[0]
                 .suggestions

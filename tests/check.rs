@@ -69,6 +69,11 @@ fn says_which_word_a_request_is_missing_its_determiner_before() {
     }
     assert_eq!(check("Please provide the report").1, "");
     assert_eq!(check("send ").1, "", "the noun is still being typed");
+    assert_eq!(
+        check("send report.").1.trim_end(),
+        "5..11  report  → the report, a report",
+        "the stop is not part of the word, and `an report` is not an offer"
+    );
 }
 
 /// A class name the user got wrong is a line on stderr rather than a setting

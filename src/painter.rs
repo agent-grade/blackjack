@@ -372,6 +372,20 @@ fn runs_of(line: &Line, flag: &Flag) -> Vec<Run> {
     runs
 }
 
+/// Whether the run put a blank in this column itself, which is the difference
+/// between a cell it has to undraw and one the program has drawn over.
+fn drew_a_blank(run: &Run, col: usize) -> bool {
+    let mut at = run.col;
+    for character in run.text.chars() {
+        let width = character.width().unwrap_or(1);
+        if col < at + width {
+            return character == ' ';
+        }
+        at += width;
+    }
+    false
+}
+
 /// A word the user is still inside is not a mistake yet: the cursor in it, or
 /// at its end with nothing but more of the word to come, means they have not
 /// finished saying it. Every fragment of a long word would otherwise be
@@ -402,12 +416,13 @@ fn now_at(line: &Line, run: &Run) -> Vec<Run> {
         let width = character.width().unwrap_or(1);
         let inside =
             row == run.row && spot >= run.col && spot + width <= run.col + run.text.width();
-        // A blank is the box's own padding, or the placeholder the model reads
-        // as one. Writing a space back over either would be this painter
-        // drawing rather than undrawing, so the cell is left alone — and a
-        // doubled word, which is one flag over two words with a space between
-        // them, comes off in the two pieces the box is showing.
-        if !inside || character == ' ' {
+        // A blank the box is showing where this run drew a word is the
+        // program's own — its write, or the dim placeholder the model reads as
+        // a blank — and writing a space back would be this painter drawing
+        // rather than undrawing. A blank where the run drew a blank is this
+        // painter's own, and comes off like anything else it drew: a rule about
+        // the gap between two words underlines the gap.
+        if !inside || (character == ' ' && !drew_a_blank(run, spot)) {
             continue;
         }
         match found.last_mut() {
@@ -921,9 +936,10 @@ mod tests {
     }
 
     /// Taking an underline off means writing the box's own characters back
-    /// where they stand. A blank is not one of those: it is the box's padding,
-    /// or the placeholder the model reads as blank, and a space written there
-    /// is this painter drawing over the program.
+    /// where they stand. A blank where the underline stood over a word is not
+    /// one of those: it is the box's padding, or the placeholder the model
+    /// reads as blank, and a space written there is this painter drawing over
+    /// the program.
     #[test]
     fn a_cell_the_box_left_blank_is_not_written_back_over() {
         let mut painter = checking(&["teh"]);
@@ -953,12 +969,12 @@ mod tests {
         );
     }
 
-    /// A doubled word is one flag over two words with a space between them.
-    /// The space is the box's own cell, so the underline comes off in the two
-    /// pieces it was drawn in — both of them, or the second word keeps its
-    /// underline for the rest of the session.
+    /// A doubled word is one flag over two words with the space between them
+    /// underlined too, and it comes off the way it went on: in one piece,
+    /// space included. Taking off only the words would leave the gap underlined
+    /// for the rest of the session.
     #[test]
-    fn a_doubled_word_comes_off_in_both_of_its_pieces() {
+    fn a_doubled_word_comes_off_the_way_it_went_on() {
         let learned = SharedLearned::default();
         let (mut painter, _) = spanning(0..7);
         painter.learned = learned.clone();
@@ -972,12 +988,30 @@ mod tests {
         let taken_off =
             String::from_utf8_lossy(&ask(&mut painter, &drawn).expect("taken off")).into_owned();
         assert!(
-            taken_off.contains("\x1b[2;3H\x1b[59m\x1b[24mthe"),
-            "{taken_off:?}"
+            taken_off.contains("\x1b[2;3H\x1b[59m\x1b[24mthe the"),
+            "the gap or the second word kept its underline: {taken_off:?}"
         );
+    }
+
+    /// The rule whose subject is the gap underlines the gap, and an underline
+    /// on a blank cell has to come off like any other. It could not: the erase
+    /// re-read the line and skipped every blank, so it wrote nothing at all
+    /// while the painter forgot it had drawn there.
+    #[test]
+    fn an_underline_drawn_on_a_blank_comes_off_too() {
+        let learned = SharedLearned::default();
+        let (mut painter, _) = spanning(1..3);
+        painter.learned = learned.clone();
+        let drawn = box_holding("a  double");
+        assert!(paint_of(&mut painter, &drawn).is_some(), "never underlined");
+
+        learned.lock().expect("learned").insert("  ".to_string());
+        let taken_off =
+            String::from_utf8_lossy(&ask(&mut painter, &drawn).expect("taken off")).into_owned();
+
         assert!(
-            taken_off.contains("\x1b[2;7H\x1b[59m\x1b[24mthe"),
-            "the second word kept its underline: {taken_off:?}"
+            taken_off.contains("\x1b[2;4H\x1b[59m\x1b[24m  "),
+            "the gap kept its underline: {taken_off:?}"
         );
     }
 

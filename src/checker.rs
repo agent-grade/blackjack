@@ -27,9 +27,7 @@ pub enum Class {
 /// the time a single accented character precedes the word. A span stands over
 /// something the user can see: an engine whose rule wants a word put into the
 /// gap between two others moves the flag onto a word before handing it over.
-/// The exception is a fix that is the gap itself, and it is one the painter
-/// still owes — an underline drawn on a blank cell is one it cannot take off
-/// again.
+/// The exception is a fix that is the gap itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
     pub span: Range<usize>,
