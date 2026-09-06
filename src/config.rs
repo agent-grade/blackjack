@@ -260,20 +260,17 @@ mod tests {
     fn the_defaults_watch_every_class_and_pause_for_400ms() {
         let config = Config::default();
 
-        for class in [
-            "articles",
-            "its-its",
-            "lets-lets",
-            "repeated",
-            "spacing",
-            "to-too",
-            "then-than",
-        ] {
+        for class in crate::harper::classes() {
             assert!(
                 config.grammar.iter().any(|watched| watched == class),
                 "{class} is not watched by default"
             );
         }
+        assert_eq!(
+            config.grammar.len(),
+            crate::harper::classes().count(),
+            "the defaults are every class and nothing else"
+        );
         assert_eq!(config.pause(), Duration::from_millis(400));
         assert_eq!(config.dict_path, None);
     }

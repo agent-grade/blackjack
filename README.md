@@ -81,15 +81,17 @@ dict_path = "~/.config/blackjack/words.txt"
 
 # The grammar slips to flag; spelling is always on. Remove a class to
 # silence it; a name that is not one of these is reported at startup.
-#   articles    a/an picked before the word was
-#   its-its     its for it's, and back
-#   lets-lets   lets for let's
-#   repeated    a word typed twice
-#   spacing     two spaces where one was meant
-#   to-too      too where the infinitive marker was meant
-#   then-than   then for a comparison
+#   articles          a/an picked before the word was
+#   articles-missing  a determiner left out of a request
+#   its-its           its for it's, and back
+#   lets-lets         lets for let's
+#   repeated          a word typed twice
+#   spacing           two spaces where one was meant
+#   to-too            too where the infinitive marker was meant
+#   then-than         then for a comparison
 grammar = [
-  "articles", "its-its", "lets-lets", "repeated", "spacing", "to-too", "then-than",
+  "articles", "articles-missing", "its-its", "lets-lets", "repeated", "spacing",
+  "to-too", "then-than",
 ]
 
 # How long typing has to pause before the line is checked and painted.

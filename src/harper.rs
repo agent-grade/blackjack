@@ -15,6 +15,8 @@ use crate::checker::{Checker, Class, Edit, Flag};
 const CLASSES: &[(&str, &[&str])] = &[
     // The wrong indefinite article, which the finger picks before the word is.
     ("articles", &["AnA"]),
+    // A determiner left out of a request: `send report` for `send a report`.
+    ("articles-missing", &["MissingDeterminer"]),
     // `its` for `it's` and back, the apostrophe rule that inverts between them.
     ("its-its", &["ItsContraction", "ItsPossessive"]),
     // `lets` for `let's`, the same inversion on another word.
@@ -44,6 +46,10 @@ const CLASSES: &[(&str, &[&str])] = &[
 // `Theres` and `ThatThan` were tried and dropped for the opposite reason: none
 // of them fired on the slip it is named for, and a class whose rule never
 // speaks is a line of config that does nothing.
+//
+// `DeterminerWithoutNoun` is not on this list because it cannot be: harper
+// 2.8.0 ships the rule and its tests but never registers it in the curated
+// group, so asking for it by name turns nothing on and says nothing.
 //
 // Harper 2.8.0 has no single `Matcher` rule to turn on: its curated group holds
 // 828 separately named rules, most of them one phrase each, so a `phrases`
@@ -96,6 +102,7 @@ impl HarperChecker {
 impl Checker for HarperChecker {
     fn check(&mut self, line: &str) -> Vec<Flag> {
         let document = Document::new_plain_english(line, &*self.dictionary);
+        let characters: Vec<char> = line.chars().collect();
 
         let mut flags: Vec<Flag> = self
             .rules
@@ -103,6 +110,7 @@ impl Checker for HarperChecker {
             .into_iter()
             .filter(|(rule, _)| is_curated(rule))
             .flat_map(|(rule, lints)| {
+                let characters = &characters;
                 // The engine already knows which of its rules spoke, so the
                 // class is read off the rule rather than guessed at from the
                 // words the span covers.
@@ -110,10 +118,15 @@ impl Checker for HarperChecker {
                     true => Class::Spelling,
                     false => Class::Grammar,
                 };
-                lints.into_iter().map(move |lint| Flag {
-                    span: lint.span.start..lint.span.end,
-                    class,
-                    suggestions: lint.suggestions.iter().map(edit_of).collect(),
+                lints.into_iter().filter_map(move |lint| {
+                    anchored(
+                        characters,
+                        Flag {
+                            span: lint.span.start..lint.span.end,
+                            class,
+                            suggestions: lint.suggestions.iter().map(edit_of).collect(),
+                        },
+                    )
                 })
             })
             .collect();
@@ -132,6 +145,52 @@ fn is_curated(rule: &str) -> bool {
         || CLASSES
             .iter()
             .any(|(_, class_rules)| class_rules.contains(&rule))
+}
+
+/// A flag with something to underline. A rule that wants a word put into the gap
+/// between two others — a determiner that should have been in it — hands back a
+/// span of whitespace and offers with a space each side, which is an underline
+/// under nothing. It is moved onto the word after the gap and its offers are
+/// folded into that word, so `send report` flags `report` and offers `a report`.
+/// A gap with no word after it is dropped: there is nothing to underline, and
+/// the user is still typing the noun.
+///
+/// A rule whose fix is the gap itself stays on it — `spacing` says two spaces
+/// should be one, and there is no word to move that onto.
+fn anchored(characters: &[char], flag: Flag) -> Option<Flag> {
+    let blank = characters
+        .get(flag.span.clone())
+        .is_some_and(|over| !over.is_empty() && over.iter().all(|c| c.is_whitespace()));
+    let inserts_a_word = flag.suggestions.iter().any(|edit| match edit {
+        Edit::Replace(offer) => !offer.trim().is_empty(),
+        _ => false,
+    });
+    if !blank || !inserts_a_word {
+        return Some(flag);
+    }
+    let from = flag.span.end;
+    let to = characters
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(characters.len(), |(at, _)| at);
+    if from >= to {
+        return None;
+    }
+    let word: String = characters[from..to].iter().collect();
+    Some(Flag {
+        span: from..to,
+        class: flag.class,
+        suggestions: flag
+            .suggestions
+            .into_iter()
+            .map(|edit| match edit {
+                Edit::Replace(offer) => Edit::Replace(format!("{}{word}", offer.trim_start())),
+                other => other,
+            })
+            .collect(),
+    })
 }
 
 /// All three shapes a suggestion comes in. Read as a bare word an insertion or
@@ -387,6 +446,67 @@ mod tests {
 
             assert!(flags.is_empty(), "{line:?} asked as {asked:?}: {flags:?}");
         }
+    }
+
+    /// The determiner rule's own span is the gap it wants a word put into, which
+    /// is an underline under nothing. By the time a flag leaves here it stands
+    /// on the word after the gap, and its offers read as that word with the
+    /// determiner in front of it — so the fix key puts the line right in one
+    /// press and the underline is somewhere the user can see.
+    #[test]
+    fn a_determiner_missing_before_a_word_is_flagged_on_the_word() {
+        let flags = checker().check("send report");
+
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].span, 5..11);
+        assert_eq!(flags[0].class, Class::Grammar);
+        assert!(
+            flags[0]
+                .suggestions
+                .contains(&Edit::Replace("a report".into())),
+            "{:?}",
+            flags[0].suggestions
+        );
+    }
+
+    /// Nothing this engine hands over stands on whitespace alone — except the
+    /// one rule whose fix is the whitespace, which has no word to move onto.
+    /// This is the contract's own test: a painter asked to underline a gap
+    /// would be answering for a mistake made here.
+    #[test]
+    fn no_flag_stands_on_a_gap_unless_the_gap_is_the_fix() {
+        let mut checker = checker();
+
+        for line in [
+            "send report",
+            "we need quick fix",
+            "add brief comment",
+            "please provide detailed reproduction of this",
+            "a  double space",
+        ] {
+            let characters: Vec<char> = line.chars().collect();
+            for flag in checker.check(line) {
+                let over: String = characters[flag.span.clone()].iter().collect();
+                let fix_is_the_gap = flag
+                    .suggestions
+                    .iter()
+                    .any(|edit| matches!(edit, Edit::Replace(offer) if offer.trim().is_empty()));
+
+                assert!(
+                    !over.trim().is_empty() || fix_is_the_gap,
+                    "{line:?} flagged {:?}, which is nothing to underline",
+                    flag.span
+                );
+            }
+        }
+    }
+
+    /// A gap with no word after it is the user still typing the noun, and there
+    /// is nothing to underline until they have.
+    #[test]
+    fn a_gap_at_the_end_of_the_line_is_not_flagged_yet() {
+        assert!(checker().check("send ").is_empty());
+        assert!(checker().check("we need quick ").is_empty());
     }
 
     #[test]

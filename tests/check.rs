@@ -53,6 +53,24 @@ fn says_nothing_about_an_article_in_front_of_something_removed() {
     );
 }
 
+/// The determiner the request never got. The rule's own subject is the gap, so
+/// what a user sees is the word after it, offered with the determiner in front —
+/// one press of the fix key puts the line right.
+#[test]
+fn says_which_word_a_request_is_missing_its_determiner_before() {
+    for (line, span, offer) in [
+        ("send report", "5..11  report", "a report"),
+        ("we need quick fix", "8..13  quick", "a quick"),
+        ("add brief comment", "4..9  brief", "a brief"),
+    ] {
+        let out = check(line).1;
+        assert!(out.starts_with(span), "for {line:?}: {out:?}");
+        assert!(out.contains(offer), "for {line:?}: {out:?}");
+    }
+    assert_eq!(check("Please provide the report").1, "");
+    assert_eq!(check("send ").1, "", "the noun is still being typed");
+}
+
 /// A class name the user got wrong is a line on stderr rather than a setting
 /// that quietly does nothing, which a silenced class looks exactly like.
 #[test]
