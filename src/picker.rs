@@ -77,10 +77,6 @@ impl Chord {
     /// configured, on such a terminal the fix key is their character with alt.
     /// A chord like `ctrl+.` has no character of its own in ASCII, so without
     /// this there would be nothing to press at all.
-    ///
-    /// `cmd` is the one modifier no terminal sends of its own accord — it
-    /// belongs to the application — so a chord holding it answers to the kitty
-    /// form only, from a terminal the user has bound to send it.
     pub fn matches(&self, keys: &[u8]) -> bool {
         let kitty = format!("\x1b[{};{}u", self.character as u32, self.modifiers + 1);
         if keys == kitty.as_bytes() {
@@ -560,13 +556,9 @@ mod tests {
         std::fs::remove_file(&words).ok();
     }
 
-    /// Pressing it again on a word already known has nothing to do, so the
-    /// keystroke belongs to the wrapped program after all.
-    /// The command key, which the config can now name. It is the one modifier
-    /// no terminal sends unasked, so the kitty form is what a terminal bound to
-    /// send it produces — and the escape-prefixed fallback still answers, as it
-    /// does for every chord, since a terminal that cannot say which modifier
-    /// was held is exactly the one that has nothing else to offer.
+    /// The command key, which the config can now name: it parses, writes back
+    /// the way it was written, and answers to the kitty form a bound terminal
+    /// sends.
     #[test]
     fn the_command_key_is_a_chord_the_config_can_name() {
         let chord = Chord::parse("cmd+.").expect("a chord");
@@ -583,6 +575,8 @@ mod tests {
         );
     }
 
+    /// Pressing it again on a word already known has nothing to do, so the
+    /// keystroke belongs to the wrapped program after all.
     #[test]
     fn learning_a_word_twice_is_a_keystroke_the_program_gets() {
         let (mut picker, _, words) = learning(

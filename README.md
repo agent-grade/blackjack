@@ -100,10 +100,9 @@ pause_ms = 400
 # The two keys above, if these are not the ones you want: modifiers joined by
 # `+`, then the character. The modifiers are `ctrl`, `alt`, `shift` and `cmd`.
 # No terminal sends `cmd` of its own accord, so a chord holding it works only
-# where the terminal has been bound to send it. `ctrl`, `alt`, `shift` and `cmd` are the modifiers;
-# a terminal only sends `cmd` where you have bound it to, and one that does not
-# speak the kitty keyboard protocol can send the key with `alt` and nothing
-# else.
+# where the terminal has been bound to send it, and a terminal that does not
+# speak the kitty keyboard protocol can send any chord only as `alt` and the
+# character.
 fix_key = "ctrl+."
 learn_key = "ctrl+,"
 ```
