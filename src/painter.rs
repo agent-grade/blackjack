@@ -517,7 +517,6 @@ mod tests {
             vec![Flag {
                 span: self.0.clone(),
                 class: crate::checker::Class::Spelling,
-                message: String::new(),
                 suggestions: Vec::new(),
             }]
         }

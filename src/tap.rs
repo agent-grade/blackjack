@@ -350,7 +350,6 @@ mod tests {
         vec![crate::checker::Flag {
             span,
             class: crate::checker::Class::Spelling,
-            message: String::new(),
             suggestions: fixes.to_vec(),
         }]
     }

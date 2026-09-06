@@ -330,7 +330,6 @@ mod tests {
         Flag {
             span,
             class,
-            message: String::new(),
             suggestions: suggestions.to_vec(),
         }
     }

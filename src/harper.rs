@@ -113,7 +113,6 @@ impl Checker for HarperChecker {
                 lints.into_iter().map(move |lint| Flag {
                     span: lint.span.start..lint.span.end,
                     class,
-                    message: lint.message,
                     suggestions: lint.suggestions.iter().map(edit_of).collect(),
                 })
             })

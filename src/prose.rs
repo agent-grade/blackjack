@@ -27,7 +27,7 @@ pub fn filtered(line: &str) -> String {
     let mut prose = String::with_capacity(line.len());
     for (token, code) in classified(line) {
         match code {
-            true => prose.extend(token.chars().map(hole)),
+            true => prose.extend(token.chars().map(fill)),
             false => prose.push_str(token),
         }
     }
@@ -88,7 +88,7 @@ fn classified(line: &str) -> impl Iterator<Item = (&str, bool)> {
 
 /// Whitespace is what tokens are counted by, so it is the one thing a hole must
 /// not be filled with: the words either side of it would close up into one.
-fn hole(character: char) -> char {
+fn fill(character: char) -> char {
     match character.is_whitespace() {
         true => character,
         false => FILLER,
@@ -110,7 +110,16 @@ fn is_code(token: &str) -> bool {
     {
         return true;
     }
-    dotted(token) || cased(token)
+    dotted(token) || dotfile(token) || cased(token)
+}
+
+/// A dot starting the token with a word after it: `.gitignore`, `.env`, the
+/// name of a thing rather than the end of a sentence. A dot on its own, or a
+/// row of them, is punctuation and stays where it is.
+fn dotfile(word: &str) -> bool {
+    word.strip_prefix('.')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(char::is_alphanumeric)
 }
 
 /// A dot with letters both sides — a file extension, a host, a qualified name.
@@ -154,13 +163,16 @@ mod tests {
             "https://example.com/x",
             "camelCase",
             "PascalCase",
+            ".gitignore",
+            ".env",
         ] {
             assert!(is_code(code), "{code} read as prose");
         }
     }
 
     /// And what it is not full of. A capital starting a word is a sentence, a
-    /// dot ending one is a full stop, and a hyphen inside one is a word.
+    /// dot ending one is a full stop, a dot standing alone is punctuation, and
+    /// a hyphen inside one is a word.
     #[test]
     fn ordinary_words_are_prose() {
         // `harper-core` is here on purpose: a hyphenated crate name and a
@@ -176,6 +188,8 @@ mod tests {
             "it's",
             "teh",
             "recieve",
+            ".",
+            "...",
         ] {
             assert!(!is_code(word), "{word} read as code");
         }

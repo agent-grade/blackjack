@@ -29,7 +29,6 @@ pub enum Class {
 pub struct Flag {
     pub span: Range<usize>,
     pub class: Class,
-    pub message: String,
     pub suggestions: Vec<Edit>,
 }
 
@@ -74,10 +73,9 @@ impl Checker for FakeChecker {
         words(line)
             .into_iter()
             .filter(|(_, word)| self.flagged.iter().any(|flagged| flagged == word))
-            .map(|(span, word)| Flag {
+            .map(|(span, _)| Flag {
                 class: Class::Spelling,
                 span,
-                message: format!("`{word}` is flagged"),
                 suggestions: self.fixes.clone(),
             })
             .collect()

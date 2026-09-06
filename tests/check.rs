@@ -13,10 +13,19 @@ fn prints_the_flag_where_it_is_and_what_is_offered_for_it() {
 }
 
 /// The same filter the painter runs: a path is three misspelled words to a
-/// dictionary and none of them reaches it.
+/// dictionary and none of them reaches it, and a name that opens with a dot is
+/// a name and not a sentence that started badly.
 #[test]
 fn says_nothing_about_a_line_that_is_not_prose() {
     assert_eq!(check("src/pty.rs").1, "");
+    assert_eq!(check("the a.out binary is not in .gitignore").1, "");
+    let (_, dotted, _) = check("teh. and .env");
+    assert!(dotted.starts_with("0..3"), "{dotted:?}");
+    assert_eq!(
+        dotted.lines().count(),
+        1,
+        "a dot ending a word leaves the word, and a dot starting one takes it"
+    );
 }
 
 /// And nothing about the hole the filter leaves either — the words either side
@@ -31,20 +40,13 @@ fn says_nothing_about_words_a_removed_path_left_next_to_each_other() {
     );
 }
 
-/// Nor about the article in front of one. The word after `a` is the word the
+/// Nor about the article in front of one: the word after `a` is the word the
 /// rule is about, and where that word was a flag the filter took out, the hole
-/// is what it reads — not the next real word along, which is how a correct `a`
-/// was told to become `an` about once in twenty prompt lines.
+/// is what it reads. One line of the corpus is enough here — the shapes are the
+/// unit tests' to own; this is the wiring.
 #[test]
 fn says_nothing_about_an_article_in_front_of_something_removed() {
-    for line in [
-        "add a --json option to the CLI",
-        "i want an --offline flag for the checker",
-        "open src/main.rs and add an --exit-code flag",
-        "is this a std::io::Error or an anyhow::Error",
-    ] {
-        assert_eq!(check(line).1, "", "for {line:?}");
-    }
+    assert_eq!(check("add a --json option to the CLI").1, "");
     assert!(
         check("This is an mule.").1.contains("→ a"),
         "an article the user did get wrong is still flagged"
