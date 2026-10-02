@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 
 import { LocalLinter } from '../engine/vendor/harper/index.js'
 import { binary } from '../engine/vendor/harper/binary.js'
-import { enabledConfig, lint } from '../engine/flags.mts'
+import { enabledConfig, lint, type Flag } from '../engine/flags.mts'
+import { decorationsOf } from '../hooks/spans.ts'
 
 const SLIPS = [
   'create file',
@@ -83,11 +84,14 @@ async function engine() {
   const linter = new LocalLinter({ binary })
   await linter.setup()
   await linter.setLintConfig(enabledConfig(await linter.getLintConfig()))
-  return async (line: string) => (await lint(linter, line)).filter(flag => flag.kind === 'grammar')
+  return (line: string) => lint(linter, line)
 }
 
+const grammar = (check: (line: string) => Promise<Flag[]>) => async (line: string) =>
+  (await check(line)).filter(flag => flag.kind === 'grammar')
+
 test('grammar catches the slips and leaves the clean lines alone', async () => {
-  const check = await engine()
+  const check = grammar(await engine())
   const caught = []
   for (const line of SLIPS) if ((await check(line)).length > 0) caught.push(line)
   const falsely = []
@@ -96,7 +100,16 @@ test('grammar catches the slips and leaves the clean lines alone', async () => {
   assert.deepEqual(falsely, [])
 })
 
-test('a missing determiner is flagged on the noun that lacks it', async () => {
+test('a missing determiner is flagged on the noun, offering only the articles it takes', async () => {
+  const check = grammar(await engine())
+  assert.deepEqual(await check('send report'), [{ start: 5, end: 11, kind: 'grammar', offers: ['the report', 'a report'] }])
+})
+
+test('an underline after an emoji lands on the word, through the whole paint path', async () => {
   const check = await engine()
-  assert.deepEqual(await check('send report'), [{ start: 5, end: 11, kind: 'grammar' }])
+  const text = '😀 fix teh bug'
+  const flags = await check(text)
+  assert.deepEqual(flags.map(({ start, end }) => [start, end]), [[7, 10]], 'the engine counts UTF-16 units')
+  const painted = decorationsOf(text, flags, text.length)
+  assert.deepEqual(painted.map(({ start, end }) => text.slice(start, end)), ['teh'])
 })

@@ -23,12 +23,12 @@ const isCased = (word: string) => /\p{Ll}\p{Lu}/u.test(word)
 
 export function filtered(line: string): string {
   return classified(line)
-    .map(({ token, code }) => (code ? token.replace(/\S/gu, FILLER) : token))
+    .map(({ token, code }) => (code ? token.replace(/\S/g, FILLER) : token))
     .join('')
 }
 
 function takenOut(line: string): boolean[] {
-  return classified(line).flatMap(({ token, code }) => Array.from(token).map(c => code && !/\s/.test(c)))
+  return classified(line).flatMap(({ token, code }) => token.split('').map(c => code && !/\s/.test(c)))
 }
 
 export function intact(line: string, { start, end }: { start: number; end: number }): boolean {

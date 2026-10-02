@@ -62,9 +62,9 @@ test('a token that fills to itself is still a hole', () => {
   assert.equal(intact(line, { start: 0, end: 3 }), true)
 })
 
-test('the hole counts code points', () => {
+test('the hole counts UTF-16 units, so the line keeps its length', () => {
   const line = '𝐀 src/x teh'
-  assert.equal(Array.from(filtered(line)).length, Array.from(line).length)
-  assert.equal(intact(line, { start: 8, end: 11 }), true)
-  assert.equal(intact(line, { start: 2, end: 7 }), false)
+  assert.equal(filtered(line).length, line.length)
+  assert.equal(intact(line, { start: 9, end: 12 }), true)
+  assert.equal(intact(line, { start: 3, end: 8 }), false)
 })
