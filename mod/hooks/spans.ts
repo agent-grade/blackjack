@@ -1,6 +1,8 @@
 import type { PromptDecoration } from 'claude-code'
 
-export type Flag = { start: number; end: number }
+export type Flag = { start: number; end: number; kind: 'spelling' | 'grammar' }
+
+const COLOR = { spelling: 'red', grammar: 'blueBright' } as const
 
 export function codePointToUnit(text: string): number[] {
   const units = [0]
@@ -23,7 +25,7 @@ export function decorationsOf(text: string, flags: Flag[], cursor: number): Prom
   const units = codePointToUnit(text)
   const unitOf = (codePoint: number) => units[codePoint] ?? text.length
   return flags
-    .map(flag => ({ start: unitOf(flag.start), end: unitOf(flag.end) }))
+    .map(flag => ({ start: unitOf(flag.start), end: unitOf(flag.end), color: COLOR[flag.kind] }))
     .filter(({ start, end }) => !isBeingTyped(text, cursor, start, end))
-    .map(({ start, end }) => ({ start, end, underline: true, color: 'red' }))
+    .map(({ start, end, color }) => ({ start, end, underline: true, color }))
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { codePointToUnit, decorationsOf, isBeingTyped } from '../hooks/spans.ts'
 
-const flag = (start: number, end: number) => ({ start, end })
+const flag = (start: number, end: number) => ({ start, end, kind: 'spelling' as const })
 const red = (start: number, end: number) => ({ start, end, underline: true, color: 'red' })
 const AWAY = 100
 
@@ -21,6 +21,12 @@ test('an astral character before the flag shifts the unit offsets by one', () =>
 
 test('a code point count past the text clamps to its end', () => {
   assert.deepEqual(decorationsOf('teh', [flag(0, 9)], AWAY), [red(0, 3)])
+})
+
+test('a grammar flag paints blue', () => {
+  assert.deepEqual(decorationsOf('its fine', [{ start: 0, end: 3, kind: 'grammar' }], AWAY), [
+    { start: 0, end: 3, underline: true, color: 'blueBright' },
+  ])
 })
 
 test('the unit table has one entry per code point boundary', () => {
