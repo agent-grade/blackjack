@@ -1,28 +1,32 @@
-import type { PromptDecoration, Register } from 'claude-code'
+import type { Register } from 'claude-code'
 
-const FLAGGED = /\bteh\b/g
-const FIX_TRIGGER = ';'
-
-function flag(text: string): PromptDecoration[] {
-  return [...text.matchAll(FLAGGED)].map(m => ({
-    start: m.index,
-    end: m.index + m[0].length,
-    underline: true,
-    color: 'warning',
-  }))
-}
+import { decorationsOf, type Flag } from './spans.ts'
 
 export const register: Register = on => {
+  let socketPath: string | undefined
+
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    const tmp = (await $.env.get('TMPDIR')) ?? '/tmp'
+    const id = (await $.session.id()).slice(0, 8)
+    const path = `${tmp.replace(/\/$/, '')}/blackjack-${id}.sock`
+    void (async () => {
+      const engine = $.process.spawn({ argv: ['node', 'engine/server.mjs', path], cwd: $.plugin.root })
+      for await (const { stream, text } of engine) {
+        if (stream === 'stdout' && text.startsWith('ready')) socketPath = path
+        else $.ui.log(text.trimEnd(), { to: 'debug' })
+      }
+      socketPath = undefined
+    })()
+    return started
+  })
+
   on('prompt.edit', async ($, e, next) => {
-    const isChord =
-      e.inputText === FIX_TRIGGER && e.start === e.end && e.text[e.start - 1] === FIX_TRIGGER
-    if (isChord) {
-      const before = e.text.slice(0, e.start - 1).replace(FLAGGED, 'the')
-      const after = e.text.slice(e.start).replace(FLAGGED, 'the')
-      const text = before + after
-      return { text, cursor: before.length, decorations: flag(text) }
-    }
     const r = await next(e)
-    return { ...r, decorations: [...(r.decorations ?? []), ...flag(r.text)] }
+    if (!socketPath) return r
+    const response = await $.http.fetch('http://blackjack/lint', { method: 'POST', body: r.text, socketPath })
+    if (!response.ok) return r
+    const { flags } = JSON.parse(response.text) as { flags: Flag[] }
+    return { ...r, decorations: [...(r.decorations ?? []), ...decorationsOf(r.text, flags, r.cursor)] }
   })
 }
