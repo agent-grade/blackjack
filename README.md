@@ -1,8 +1,8 @@
 # blackjack
 
 Spell-check for the Claude Code prompt box. As you type, a word the dictionary
-does not know is underlined in red and a curated set of grammar slips in blue,
-inside the input line itself, in the terminal and in the desktop app. An
+does not know is underlined, and so is a curated set of grammar slips, inside
+the input line itself, in the terminal and in the desktop app. An
 editor's spell-check, where you talk to Claude.
 
 Everything runs locally: the checker is [Harper](https://github.com/Automattic/harper),
@@ -51,8 +51,8 @@ for:
   suggestion. Press it again for the next one, and once more past the last to
   get your own word back. With nothing flagged, or nothing to suggest, the two
   characters stay as typed.
-- `::` after a space keeps the nearest red word instead: the underline goes,
-  and the word is written to your list so it is not flagged again. Typed
+- `::` after a space keeps the nearest misspelled word instead: the underline
+  goes, and the word is written to your list so it is not flagged again. Typed
   directly after a word, as in `std::mem`, it is code and stays.
 
 Grammar flags are not words and cannot be learned. The classes: the wrong

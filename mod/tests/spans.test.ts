@@ -4,23 +4,21 @@ import assert from 'node:assert/strict'
 import { decorationsOf, isBeingTyped } from '../hooks/spans.ts'
 
 const flag = (start: number, end: number) => ({ start, end, kind: 'spelling' as const, offers: [] })
-const red = (start: number, end: number) => ({ start, end, underline: true, color: 'red' })
+const underlined = (start: number, end: number) => ({ start, end, underline: true })
 const AWAY = 100
 
 test('a span is painted where it is given, in UTF-16 units', () => {
-  assert.deepEqual(decorationsOf('fix teh bug', [flag(4, 7)], AWAY), [red(4, 7)])
-  assert.deepEqual(decorationsOf('🙂 teh', [flag(3, 6)], AWAY), [red(3, 6)])
+  assert.deepEqual(decorationsOf('fix teh bug', [flag(4, 7)], AWAY), [underlined(4, 7)])
+  assert.deepEqual(decorationsOf('🙂 teh', [flag(3, 6)], AWAY), [underlined(3, 6)])
 })
 
-test('a grammar flag paints blue', () => {
-  assert.deepEqual(decorationsOf('its fine', [{ start: 0, end: 3, kind: 'grammar', offers: [] }], AWAY), [
-    { start: 0, end: 3, underline: true, color: 'blueBright' },
-  ])
+test('a grammar flag is underlined the same way, with no colour on the text', () => {
+  assert.deepEqual(decorationsOf('its fine', [{ start: 0, end: 3, kind: 'grammar', offers: [] }], AWAY), [underlined(0, 3)])
 })
 
 test('the word being typed is not flagged until the cursor leaves it', () => {
   assert.deepEqual(decorationsOf('teh', [flag(0, 3)], 3), [], 'cursor at the end of the word')
-  assert.deepEqual(decorationsOf('teh ', [flag(0, 3)], 4), [red(0, 3)], 'a space finished it')
+  assert.deepEqual(decorationsOf('teh ', [flag(0, 3)], 4), [underlined(0, 3)], 'a space finished it')
   assert.deepEqual(decorationsOf('teh ', [flag(0, 3)], 2), [], 'cursor moved back inside')
 })
 

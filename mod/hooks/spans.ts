@@ -2,8 +2,6 @@ import type { PromptDecoration } from 'claude-code'
 
 export type Flag = { start: number; end: number; kind: 'spelling' | 'grammar'; offers: string[] }
 
-const COLOR = { spelling: 'red', grammar: 'blueBright' } as const
-
 const WORD_CHARACTER = /^[\p{L}\p{N}]/u
 
 export function isBeingTyped(text: string, cursor: number, start: number, end: number): boolean {
@@ -14,5 +12,5 @@ export function isBeingTyped(text: string, cursor: number, start: number, end: n
 export function decorationsOf(text: string, flags: Flag[], cursor: number): PromptDecoration[] {
   return flags
     .filter(({ start, end }) => !isBeingTyped(text, cursor, start, end))
-    .map(({ start, end, kind }) => ({ start, end, underline: true, color: COLOR[kind] }))
+    .map(({ start, end }) => ({ start, end, underline: true }))
 }
