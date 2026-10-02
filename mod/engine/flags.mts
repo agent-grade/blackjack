@@ -1,4 +1,5 @@
-import type { Lint, LintConfig } from './vendor/harper/index.js'
+import type { Lint, LintConfig, LocalLinter } from './vendor/harper/index.js'
+import { filtered, intact } from './prose.mts'
 
 export const SPELLING = 'SpellCheck'
 
@@ -52,4 +53,9 @@ export function flagsOf(text: string, organized: Record<string, Lint[]>): Flag[]
     }
   }
   return flags.sort((a, b) => a.start - b.start || a.end - b.end)
+}
+
+export async function lint(linter: LocalLinter, text: string): Promise<Flag[]> {
+  const prose = filtered(text)
+  return flagsOf(prose, await linter.organizedLints(prose, { language: 'plaintext' })).filter(flag => intact(text, flag))
 }

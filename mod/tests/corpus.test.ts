@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { LocalLinter } from '../engine/vendor/harper/index.js'
 import { binary } from '../engine/vendor/harper/binary.js'
-import { enabledConfig, flagsOf } from '../engine/flags.mts'
+import { enabledConfig, lint } from '../engine/flags.mts'
 
 const SLIPS = [
   'create file',
@@ -83,21 +83,20 @@ async function engine() {
   const linter = new LocalLinter({ binary })
   await linter.setup()
   await linter.setLintConfig(enabledConfig(await linter.getLintConfig()))
-  return async (line: string) =>
-    flagsOf(line, await linter.organizedLints(line, { language: 'plaintext' })).filter(f => f.kind === 'grammar')
+  return async (line: string) => (await lint(linter, line)).filter(flag => flag.kind === 'grammar')
 }
 
 test('grammar catches the slips and leaves the clean lines alone', async () => {
-  const lint = await engine()
+  const check = await engine()
   const caught = []
-  for (const line of SLIPS) if ((await lint(line)).length > 0) caught.push(line)
+  for (const line of SLIPS) if ((await check(line)).length > 0) caught.push(line)
   const falsely = []
-  for (const line of CLEAN) if ((await lint(line)).length > 0) falsely.push(line)
+  for (const line of CLEAN) if ((await check(line)).length > 0) falsely.push(line)
   assert.ok(caught.length >= 25, `caught ${caught.length} of ${SLIPS.length}; the Rust checker caught 25`)
-  assert.deepEqual(falsely, ['the a.out binary is not in .gitignore'])
+  assert.deepEqual(falsely, [])
 })
 
 test('a missing determiner is flagged on the noun that lacks it', async () => {
-  const lint = await engine()
-  assert.deepEqual(await lint('send report'), [{ start: 5, end: 11, kind: 'grammar' }])
+  const check = await engine()
+  assert.deepEqual(await check('send report'), [{ start: 5, end: 11, kind: 'grammar' }])
 })

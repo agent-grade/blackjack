@@ -2,7 +2,7 @@ import { createServer } from 'node:http'
 import { unlink } from 'node:fs/promises'
 import { LocalLinter } from './vendor/harper/index.js'
 import { binary } from './vendor/harper/binary.js'
-import { enabledConfig, flagsOf } from './flags.mts'
+import { enabledConfig, lint } from './flags.mts'
 
 const socketPath = process.argv[2]
 
@@ -10,9 +10,9 @@ const linter = new LocalLinter({ binary })
 await linter.setup()
 await linter.setLintConfig(enabledConfig(await linter.getLintConfig()))
 
-async function lint(text) {
+async function flagsOf(text) {
   try {
-    return flagsOf(text, await linter.organizedLints(text, { language: 'plaintext' }))
+    return await lint(linter, text)
   } catch (error) {
     console.error(`lint failed: ${error}`)
     return []
@@ -29,7 +29,7 @@ const server = createServer((request, response) => {
   request.on('data', chunk => (body += chunk))
   request.on('end', async () => {
     response.setHeader('content-type', 'application/json')
-    response.end(JSON.stringify({ flags: await lint(body) }))
+    response.end(JSON.stringify({ flags: await flagsOf(body) }))
   })
 })
 
