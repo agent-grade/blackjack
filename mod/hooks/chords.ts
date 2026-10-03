@@ -3,15 +3,14 @@ import type { PromptEditInput } from 'claude-code'
 import type { Flag } from './spans.ts'
 
 export const FIX = ';;'
-export const LEARN = '::'
+export const LEARN = ';+'
 
 export type Box = { text: string; cursor: number }
 
-export function chordAt(e: PromptEditInput, pair: string, afterSpace = false): Box | undefined {
+export function chordAt(e: PromptEditInput, pair: string): Box | undefined {
   const burst = e.inputText === pair
   const at = burst ? e.start : e.start - 1
   if (!burst && (e.inputText !== pair[1] || e.start !== e.end || e.text[at] !== pair[0])) return undefined
-  if (afterSpace && at > 0 && !/\s/.test(e.text[at - 1]!)) return undefined
   return { text: e.text.slice(0, at) + e.text.slice(e.end), cursor: at }
 }
 

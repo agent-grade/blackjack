@@ -51,9 +51,8 @@ for:
   suggestion. Press it again for the next one, and once more past the last to
   get your own word back. With nothing flagged, or nothing to suggest, the two
   characters stay as typed.
-- `::` after a space keeps the nearest misspelled word instead: the underline
-  goes, and the word is written to your list so it is not flagged again. Typed
-  directly after a word, as in `std::mem`, it is code and stays.
+- `;+` keeps the nearest misspelled word instead: the underline goes, and the
+  word is written to your list so it is not flagged again.
 
 Grammar flags are not words and cannot be learned. The classes: the wrong
 article, a determiner left out of a request, `its` for `it's` and back, `lets`

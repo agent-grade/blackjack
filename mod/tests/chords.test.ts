@@ -30,10 +30,10 @@ test('fixing a repeated word takes the space before it along', () => {
   assert.deepEqual(turn(turned.cycle, turned.box).box, { text: 'the the cat', cursor: 11 })
 })
 
-test('the learn chord only counts after a space, so a namespace stays code', () => {
-  assert.deepEqual(chordAt(typing('teh :', ':'), LEARN, true), { text: 'teh ', cursor: 4 })
-  assert.equal(chordAt(typing('std:', ':'), LEARN, true), undefined)
-  assert.deepEqual(chordAt(typing(':', ':'), LEARN, true), { text: '', cursor: 0 })
+test('the learn chord is the pair typed in a row, anywhere', () => {
+  assert.deepEqual(chordAt(typing('teh ;', '+'), LEARN), { text: 'teh ', cursor: 4 })
+  assert.deepEqual(chordAt(typing('teh;', '+'), LEARN), { text: 'teh', cursor: 3 })
+  assert.equal(chordAt(typing('teh +', '+'), LEARN), undefined)
 })
 
 test('the nearest flag is the last one ending at or before the cursor', () => {

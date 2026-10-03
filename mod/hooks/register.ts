@@ -52,7 +52,7 @@ export const register: Register = on => {
       }
     }
 
-    const learn = chordAt(e, LEARN, true)
+    const learn = chordAt(e, LEARN)
     if (learn) {
       const flag = nearest((await lint(learn.text)).filter(f => f.kind === 'spelling'), learn.cursor)
       if (flag) {
