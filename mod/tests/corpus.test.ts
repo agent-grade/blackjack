@@ -105,7 +105,7 @@ test('a missing determiner is flagged on the noun, offering only the articles it
   assert.deepEqual(await check('send report'), [{ start: 5, end: 11, kind: 'grammar', offers: ['the report', 'a report'] }])
 })
 
-test('an underline after an emoji lands on the word, through the whole paint path', async () => {
+test('a flag after an emoji lands on the word, through the whole paint path', async () => {
   const check = await engine()
   const text = '😀 fix teh bug'
   const flags = await check(text)

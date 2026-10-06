@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "blackjack",
-      "description": "Spell-check and grammar underlines inside the Claude Code prompt box, with a fix chord and a learn chord.",
+      "description": "Spell-check and grammar flags in colour inside the Claude Code prompt box, with a fix chord and a learn chord.",
       "source": "./mod"
     }
   ]

@@ -1,9 +1,9 @@
 # blackjack
 
 Spell-check for the Claude Code prompt box. As you type, a word the dictionary
-does not know is underlined, and so is a curated set of grammar slips, inside
-the input line itself, in the terminal and in the desktop app. An
-editor's spell-check, where you talk to Claude.
+does not know turns red and a curated set of grammar slips blue, inside the
+input line itself, in the terminal and in the desktop app. An editor's
+spell-check, where you talk to Claude.
 
 Everything runs locally: the checker is [Harper](https://github.com/Automattic/harper),
 vendored as its WebAssembly build and run by Node on this machine. Nothing typed
@@ -39,19 +39,19 @@ claude --plugin-dir ~/path/to/blackjack/mod
 
 ## Using it
 
-Nothing is underlined while the cursor is still inside the word. What is not
+Nothing is flagged while the cursor is still inside the word. What is not
 prose is never checked, because at a prompt those are what you meant: a path, a
 flag, an identifier, a version, `camelCase`, a dotfile, anything between
 backticks.
 
-Two chords, typed as ordinary characters, do the two things the underlines ask
+Two chords, typed as ordinary characters, do the two things the colours ask
 for:
 
 - `;;` replaces the nearest flagged word before the cursor with the first
   suggestion. Press it again for the next one, and once more past the last to
   get your own word back. With nothing flagged, or nothing to suggest, the two
   characters stay as typed.
-- `;+` keeps the nearest misspelled word instead: the underline goes, and the
+- `;+` keeps the nearest red word instead: the colour goes, and the
   word is written to your list so it is not flagged again.
 
 Grammar flags are not words and cannot be learned. The classes: the wrong
