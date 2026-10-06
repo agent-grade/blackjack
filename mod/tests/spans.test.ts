@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { decorationsOf, isBeingTyped } from '../hooks/spans.ts'
 
 const flag = (start: number, end: number) => ({ start, end, kind: 'spelling' as const, offers: [] })
-const red = (start: number, end: number) => ({ start, end, color: 'red' })
+const red = (start: number, end: number) => ({ start, end, color: 'red', italic: true })
 const AWAY = 100
 
 test('a span is painted where it is given, in UTF-16 units', () => {
@@ -12,8 +12,8 @@ test('a span is painted where it is given, in UTF-16 units', () => {
   assert.deepEqual(decorationsOf('🙂 teh', [flag(3, 6)], AWAY), [red(3, 6)])
 })
 
-test('a grammar flag is painted blue, with no underline', () => {
-  assert.deepEqual(decorationsOf('its fine', [{ start: 0, end: 3, kind: 'grammar', offers: [] }], AWAY), [{ start: 0, end: 3, color: 'blueBright' }])
+test('a grammar flag is painted blue italic, with no underline', () => {
+  assert.deepEqual(decorationsOf('its fine', [{ start: 0, end: 3, kind: 'grammar', offers: [] }], AWAY), [{ start: 0, end: 3, color: 'blueBright', italic: true }])
 })
 
 test('the word being typed is not flagged until the cursor leaves it', () => {

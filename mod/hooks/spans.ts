@@ -14,5 +14,5 @@ export function isBeingTyped(text: string, cursor: number, start: number, end: n
 export function decorationsOf(text: string, flags: Flag[], cursor: number): PromptDecoration[] {
   return flags
     .filter(({ start, end }) => !isBeingTyped(text, cursor, start, end))
-    .map(({ start, end, kind }) => ({ start, end, color: COLOR[kind] }))
+    .map(({ start, end, kind }) => ({ start, end, color: COLOR[kind], italic: true }))
 }
