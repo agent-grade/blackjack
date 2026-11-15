@@ -13,8 +13,8 @@ Blackjack changes what you typed only when you ask it to.
 
 ## Install
 
-Needs Node 22.18 or newer on `PATH`. The repository is its own plugin
-marketplace:
+Needs Claude Code 2.1.287 or newer, Node 22.18 or newer on `PATH`, and macOS
+or Linux. The repository is its own plugin marketplace:
 
 ```sh
 claude plugin marketplace add agent-grade/blackjack
