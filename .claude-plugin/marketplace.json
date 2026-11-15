@@ -1,0 +1,12 @@
+{
+  "name": "blackjack",
+  "description": "Spell-check for the Claude Code prompt box.",
+  "owner": { "name": "Yurii Khiznichenko" },
+  "plugins": [
+    {
+      "name": "blackjack",
+      "description": "Spell-check and grammar flags in colour inside the Claude Code prompt box, with a fix chord and a learn chord.",
+      "source": "./mod"
+    }
+  ]
+}

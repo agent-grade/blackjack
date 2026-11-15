@@ -1,0 +1,6 @@
+{
+  "name": "blackjack",
+  "version": "2.0.0",
+  "description": "Spell-check and grammar flags in colour inside the Claude Code prompt box, with a fix chord and a learn chord.",
+  "author": { "name": "Yurii Khiznichenko" }
+}

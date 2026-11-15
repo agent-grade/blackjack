@@ -1,0 +1,13 @@
+{
+  "name": "blackjack",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25",
+    "typescript": "^5"
+  }
+}
