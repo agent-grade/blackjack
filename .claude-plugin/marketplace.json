@@ -6,7 +6,9 @@
     {
       "name": "blackjack",
       "description": "Spell-check and grammar flags in colour inside the Claude Code prompt box, with a fix chord and a learn chord.",
-      "source": "./mod"
+      "source": "./mod",
+      "homepage": "https://github.com/agent-grade/blackjack",
+      "repository": "https://github.com/agent-grade/blackjack"
     }
   ]
 }

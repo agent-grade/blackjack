@@ -17,17 +17,22 @@ Needs Node 22.18 or newer on `PATH`. The repository is its own plugin
 marketplace:
 
 ```sh
-claude plugin marketplace add git@gitlab.com:yuriikhi/blackjack.git
+claude plugin marketplace add agent-grade/blackjack
 ```
 
 ```sh
 claude plugin install blackjack@blackjack
 ```
 
-Updates come with Claude Code's own plugin updates, or by hand:
+Auto-update is off for a third-party marketplace until you turn it on in
+`/plugin`. To update by hand, run both, then restart Claude Code:
 
 ```sh
 claude plugin marketplace update blackjack
+```
+
+```sh
+claude plugin update blackjack@blackjack
 ```
 
 To try a checkout without installing it, start a session with the plugin
